@@ -1,0 +1,83 @@
+{
+  "source": {
+    "mode": "synthetic",
+    "channels": 2,
+    "sample_rate_hz": 250.0,
+    "block_size": 25,
+    "seed": 42,
+    "components": [
+      {
+        "hz": 6.0,
+        "amplitude": 8.0
+      },
+      {
+        "hz": 10.0,
+        "amplitude": 20.0
+      },
+      {
+        "hz": 20.0,
+        "amplitude": 6.0
+      }
+    ],
+    "noise": 2.0,
+    "mains": 12.0,
+    "drift": 15.0,
+    "anomalies": {
+      "skip_every": 0,
+      "spike_every": 0,
+      "spike_amplitude": 0.0,
+      "channel2_delay_ms": 0.0,
+      "disconnect_after_samples": null
+    },
+    "ports": [],
+    "baud_rate": 115200,
+    "replay_path": "",
+    "replay_speed": 1.0,
+    "units": null,
+    "serial_idle_timeout_ms": 3000
+  },
+  "processing": {
+    "high_pass_hz": 1.0,
+    "low_pass_hz": 80.0,
+    "notch": true,
+    "notch_hz": 50.0,
+    "notch_q": 30.0,
+    "window_samples": 500,
+    "hop_samples": 50,
+    "bands": [
+      {
+        "name": "Theta",
+        "low_hz": 4.0,
+        "high_hz": 8.0
+      },
+      {
+        "name": "Alpha/Mu",
+        "low_hz": 8.0,
+        "high_hz": 13.0
+      },
+      {
+        "name": "Beta",
+        "low_hz": 13.0,
+        "high_hz": 30.0
+      }
+    ],
+    "smoothing": 0.25,
+    "expected_abs_max": 500.0,
+    "outlier_step": 150.0,
+    "flat_stddev": 0.01,
+    "mains_ratio_limit": 0.2,
+    "sync_tolerance_ms": 4.0,
+    "baseline": []
+  },
+  "tui_hz": 15,
+  "recording_dir": "recordings",
+  "session": {
+    "name": "demo",
+    "user_id": "",
+    "electrodes": [
+      "",
+      ""
+    ],
+    "notes": ""
+  }
+}

@@ -1,0 +1,10 @@
+/target/
+/recordings/
+
+# Локальные файлы, создаваемые приложением и инструментами разработки
+.DS_Store
+.idea/
+.vscode/
+/config.json
+/settings.json
+/lemon.log

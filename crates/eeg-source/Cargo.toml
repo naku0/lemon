@@ -1,0 +1,13 @@
+[package]
+name = "eeg-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+eeg-core.workspace = true
+eeg-storage.workspace = true
+serialport.workspace = true
