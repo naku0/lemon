@@ -18,11 +18,13 @@ crossterm = "0.28"
 ctrlc = "3"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
-eeg-core = { path = "crates/eeg-core" }
-eeg-source = { path = "crates/eeg-source" }
-eeg-processing = { path = "crates/eeg-processing" }
-eeg-storage = { path = "crates/eeg-storage" }
-eeg-tui = { path = "crates/eeg-tui" }
+core_types = { package = "core", path = "crates/core" }
+source = { path = "crates/source" }
+processing = { path = "crates/processing" }
+storage = { path = "crates/storage" }
+tui = { path = "crates/tui" }
+analysis = { path = "crates/analysis" }
+report = { path = "crates/report" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

@@ -1,0 +1,16 @@
+[package]
+name = "analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+core_types.workspace = true
+processing.workspace = true
+storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true

@@ -1,5 +1,6 @@
 /target/
 /recordings/
+/docs/
 
 # Локальные файлы, создаваемые приложением и инструментами разработки
 .DS_Store
@@ -8,3 +9,14 @@
 /config.json
 /settings.json
 /lemon.log
+
+# Generated local analysis/report artifacts and Python environments
+/reports/
+/report-*/
+/analysis-*/
+.venv/
+__pycache__/
+*.lemon-report.zip
+*-colab.ipynb
+*-colab-data.zip
+.lemon-report-*.partial/

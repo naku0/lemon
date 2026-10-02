@@ -153,6 +153,10 @@ def tui_run(config, exit_key, record):
             wait_for(master, output, "Lightweight EEG")
             os.write(master, b"2vc ")
             hold(master, output, 0.2)
+            wait_for(master, output, " | Line | ")
+            for style in ("Points", "Envelope", "Line"):
+                os.write(master, b"g")
+                wait_for(master, output, f" | {style} | ")
         os.write(master, exit_key)
         if record:
             wait_for(master, output, "Confirm exit")
