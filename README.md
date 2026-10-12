@@ -1,149 +1,123 @@
 # LEMON
 
-LEMON — Lightweight EEG Monitoring Of Neuroactivity — локальное Rust-приложение для приёма, записи, обработки и технического анализа сигналов.
+LEMON — локальное приложение для записи, просмотра и технического анализа EEG-сигналов. Оно работает с Arduino Serial, CSV, DAT, DMOV и собственными записями LEMON.
 
-Приложение поддерживает синтетический demo-режим, Serial, replay, CSV/DAT/DMOV import, потоковый `analyze` и воспроизводимые Jupyter-отчёты. LEMON не является медицинским изделием: quality — инженерная эвристика, а результаты не содержат медицинской, когнитивной или психологической интерпретации.
+Если вы открыли проект впервые, начните с [пошагового руководства](docs/getting-started.md). Оно проводит от сборки до первого отчёта без подключения оборудования.
 
-## Возможности
+> LEMON показывает сигнал и численные характеристики обработки. Он не ставит диагнозы и не делает выводов о состоянии, эмоциях или намерениях человека.
 
-- TUI: Sources, Waveform, Spectrum, Bands, Recording и Settings.
-- Demo без оборудования.
-- Serial CSV и бинарный `tagged-u8`.
-- Replay и запись Raw до DSP.
-- Прямой DMOV-профиль для двух каналов Лаб2.
-- AnalysisBundle через `lemon analyze`.
-- Local notebook, portable ZIP и Colab через `lemon report`.
+## Что умеет LEMON
 
-Подробности находятся в [docs/](docs/): [архитектура](docs/architecture.md), [Serial](docs/serial.md), [DMOV](docs/dmov.md), [анализ](docs/analysis.md), [отчёты](docs/reports.md), [Settings](docs/settings.md) и [разработка](docs/development.md). Полная прежняя документация сохранена в [docs/reference.md](docs/reference.md).
+- показывает Raw, Filtered, spectrum, band power и quality в терминальном интерфейсе;
+- записывает исходные отсчёты до DSP и воспроизводит сохранённые сеансы;
+- принимает Serial CSV и бинарный tagged-u8 от Arduino;
+- импортирует CSV, DAT, DMOV и каталоги внешних записей;
+- создаёт AnalysisBundle с JSON/CSV и нейтральным техническим summary;
+- генерирует локальные Jupyter-отчёты, portable ZIP и Colab notebook;
+- запускает локальные аналитические плагины в отдельных процессах.
 
-## Требования
+## Что вы хотите сделать?
 
-- стабильный Rust и Cargo;
-- интерактивный терминал для TUI;
-- Python 3.10+ для выполнения локальных отчётов;
-- разрешение на Serial-порт при работе с оборудованием.
+| Задача | Первая команда | Инструкция |
+|---|---|---|
+| Посмотреть интерфейс без оборудования | `lemon demo` | [Быстрый старт](docs/getting-started.md) |
+| Записать сигнал с Arduino | `lemon ports` | [Serial и Arduino](docs/serial.md) |
+| Открыть старую запись | `lemon replay PATH` | [Быстрый старт](docs/getting-started.md#4-откройте-готовую-запись) |
+| Импортировать DMOV Лаб‑2 | `lemon import FILE.dmov` | [DMOV](docs/dmov.md) |
+| Получить CSV и численное резюме | `lemon analyze INPUT` | [AnalysisBundle](docs/analysis.md) |
+| Создать Jupyter Notebook | `lemon report INPUT` | [Отчёты](docs/reports.md) |
+| Запустить аналитический плагин | `lemon plugins list` | [Плагины](docs/plugins.md) |
+| Исправить ошибку запуска | — | [Частые проблемы](docs/troubleshooting.md) |
 
-Первая сборка Cargo может обращаться к crates.io. Обычная запись, replay, analyze и `report --no-execute` сеть не используют.
+## Установка
 
-## Сборка и установка
+Нужен стабильный Rust toolchain. Из корня репозитория:
 
 ```bash
-cd /Users/sniyaq/diploma/lemon
 cargo build --locked
-cargo test --locked
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo fmt --all --check
+./target/debug/lemon --version
+./target/debug/lemon demo
 ```
 
-Запуск собранного бинарника:
-
-```bash
-./target/debug/lemon --help
-```
-
-Установка глобальной команды:
+Чтобы команда `lemon` работала из любого каталога:
 
 ```bash
 cargo install --path crates/app --locked --force
 lemon --version
 ```
 
-Если macOS выдаёт `Permission denied` для системной временной папки, проверьте `TMPDIR`:
+После изменений проекта повторите `cargo install ... --force`: `cargo build` обновляет только `./target/debug/lemon`, но не установленный `~/.cargo/bin/lemon`.
+
+## Первый запуск за две минуты
 
 ```bash
-unset TMPDIR
-cargo build --locked
-```
-
-## Быстрый старт
-
-```bash
+# 1. Открыть демонстрационный сигнал
 lemon demo
+
+# 2. Создать десятисекундную тестовую запись
 lemon demo --headless --duration 10 --record
-lemon replay recordings/session-name
-lemon ports
+
+# 3. Посмотреть созданные записи
+ls recordings
+
+# 4. Проанализировать нужный каталог, напечатанный предыдущей командой
+lemon analyze recordings/SESSION --output reports/demo-analysis
+
+# 5. Создать notebook без настройки Python
+lemon report --analysis reports/demo-analysis --no-execute \
+  --output reports/demo-report
 ```
 
-По умолчанию записи создаются в `recordings/` в текущем рабочем каталоге. Путь печатается при завершении.
+`SESSION` замените именем каталога, которое LEMON напечатал после записи. В результате появятся проверяемые CSV в `reports/demo-analysis/` и notebook `reports/demo-report/report.ipynb`.
 
-## Основные команды
-
-```bash
-lemon demo [--channels 1|2] [--record]
-lemon live --port PORT --baud 115200 --protocol csv --channels 1
-lemon live --config examples/serial-tagged-u8-a0.json --port PORT --record
-lemon probe --port PORT --baud 115200 --duration 10 --output capture.bin
-lemon replay INPUT [--headless] [--duration SECONDS]
-lemon import INPUT --output recordings/session
-lemon analyze INPUT --output reports/session-analysis
-lemon report INPUT
-```
-
-Arduino UNO:
-
-```bash
-lemon live \
-  --config examples/serial-tagged-u8-a0.json \
-  --port /dev/cu.usbmodem1401 \
-  --channels 1 \
-  --record
-```
-
-Не открывайте этот порт в Arduino Serial Monitor одновременно. Открытие порта может перезапустить UNO.
-
-Лаб2:
-
-```bash
-lemon import \
-  "$HOME/Downloads/Лаб2/фон/5_10_2026_12_17_26.dmov" \
-  --output recordings/lab2-background
-```
-
-## Конфигурация
-
-- `config.json` — источник, частота, DSP, диапазоны и запись;
-- `settings.json` — тема, цвета, отображение и личные предпочтения.
-
-```bash
-lemon config init examples/local.json
-lemon config check examples/local.json
-lemon config init --user
-```
-
-Приоритет: CLI → environment → settings → experiment config → defaults.
-
-## Структура проекта
+## Типичный рабочий процесс
 
 ```text
-crates/core/       доменные типы и конфигурация
-crates/source/     synthetic, replay, Serial, decoders и probe
-crates/processing/ DSP, фильтры, PSD, bands и quality
-crates/storage/    native session и внешние форматы
-crates/analysis/   AnalysisBundle и статистика
-crates/report/     notebook, Python environment, ZIP и Colab
-crates/tui/        экраны, Settings и темы
-crates/app/        CLI и жизненный цикл
+устройство или файл
+        ↓
+native-запись LEMON / импорт
+        ↓
+lemon analyze → AnalysisBundle с CSV и summary
+        ↓
+lemon report  → Jupyter Notebook
+        └─────→ аналитические плагины
 ```
 
-## Ограничения
+Raw сохраняется отдельно от Filtered. Пропуски не заменяются нулями. Отчёты и плагины используют готовый AnalysisBundle и не меняют исходную запись.
 
-- до двух каналов в текущем live pipeline;
-- Arduino `tagged-u8` хранится в `adc_counts_u8`, без физической калибровки;
-- DMOV не доказывает синхронность отдельных каналов;
-- C3/C4 назначает пользователь;
-- quality не является клинической метрикой;
-- автоматического reconnect нет.
+## Где искать результат
 
-## Проверки
+- live/demo с `--record`: каталог `recordings/` в текущей директории;
+- `analyze --output DIR`: указанный `DIR`;
+- `report --output DIR`: `DIR/report.ipynb`;
+- `plugin run --output DIR`: `DIR/plugin-result.json` и заявленные плагином файлы.
 
-```bash
-cargo fmt --all --check
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo build --locked
-python3 scripts/smoke.py
-python3 scripts/report_smoke.py
-```
+LEMON также печатает итоговый путь после успешной команды. Существующие результаты не перезаписываются без явного `--overwrite`.
+
+## Документация
+
+Полный указатель находится в [`docs/README.md`](docs/README.md).
+
+- [Быстрый старт](docs/getting-started.md) — установка и полный учебный сценарий;
+- [Serial и Arduino](docs/serial.md) — поиск порта, `probe`, один и два канала;
+- [DMOV](docs/dmov.md) — импорт записей Лаб‑2;
+- [Технический анализ](docs/analysis.md) — содержимое AnalysisBundle;
+- [Jupyter-отчёты](docs/reports.md) — Python environment, local, ZIP и Colab;
+- [Плагины](docs/plugins.md) — подключение и запуск, включая Mu condition analysis;
+- [Settings и темы](docs/settings.md) — управление интерфейсом;
+- [Частые проблемы](docs/troubleshooting.md) — PATH, TMPDIR, Serial, Python и output;
+- [Архитектура](docs/architecture.md) и [разработка](docs/development.md) — для разработчиков.
+
+Прежняя расширенная справка сохранена как [архив](docs/reference.md); для обычного запуска она не нужна.
+
+## Основные ограничения
+
+- live pipeline поддерживает до двух выбранных каналов;
+- Arduino `tagged-u8` хранит значения как `adc_counts_u8` без пересчёта в микровольты;
+- DMOV не доказывает аппаратную синхронность каналов;
+- соответствие A0/A2 позициям C3/C4 задаёт пользователь;
+- quality является инженерной эвристикой;
+- автоматического reconnect Serial пока нет.
 
 ## Лицензия
 
