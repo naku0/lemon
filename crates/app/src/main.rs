@@ -71,6 +71,56 @@ fn run() -> Result<()> {
     }
     let environment = Environment::read()?;
     environment.validate()?;
+    if let Some(Action::Probe {
+        port,
+        baud,
+        output,
+        overwrite,
+        startup_delay_ms,
+        max_bytes,
+    }) = &cli.command
+    {
+        let seconds = cli.duration.unwrap_or(10.);
+        if seconds > 3600. {
+            return Err("probe: --duration must not exceed 3600 seconds".into());
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+            .map_err(|e| format!("probe/Ctrl+C: {e}"))?;
+        let result = source::probe(
+            &source::ProbeOptions {
+                port: port.clone(),
+                baud: *baud,
+                duration: Duration::from_secs_f64(seconds),
+                startup_delay: Duration::from_millis(*startup_delay_ms),
+                output: output.clone(),
+                overwrite: *overwrite,
+                max_bytes: *max_bytes,
+            },
+            &cancelled,
+        )?;
+        println!("Saved: {}\nStartup delay: {:.3} s; discarded startup bytes: {}\nMeasurement duration: {:.3} s (requested {:.3})\nCaptured bytes: {} ({:.1} bytes/s); LF: {}\nASCII: {}\nHEX: {}", output.display(), result.startup_seconds, result.startup_bytes, result.seconds, seconds, result.bytes, result.bytes as f64 / result.seconds.max(1e-9), result.newlines, result.ascii_preview, result.hex_preview);
+        if let Some(c) = &result.candidate {
+            println!("Candidate tagged-u8 frame: {}\nFrame size: {} bytes\nComplete frames: {}\nDiscarded prefix/suffix bytes: {}/{}; internal discarded: {}\nEstimated full frame rate: {:.3} frames/s (diagnostic only; nominal rate unchanged)",c.tags.join(","),c.frame_size,c.complete_frames,c.prefix_bytes,c.suffix_bytes,c.internal_discarded_bytes,c.complete_frames as f64 / result.seconds.max(1e-9));
+            for counter in &c.counters {
+                println!("Candidate sequence tag: {}; sequence discontinuities: {}; minimum missing (modulo 256): {}; repeated: {}",counter.tag,counter.discontinuities,counter.minimum_missing,counter.duplicates);
+            }
+            println!("Suggested signal tags: must be selected explicitly. Configuration template (replace placeholders):\n{}", serde_json::json!({"source": {"mode":"serial", "serial_protocol":"tagged-u8", "serial_frame_tags":c.tags,"serial_channel_tags":["SELECT_SIGNAL_TAG"],"serial_sequence_tag":if c.counters.len()==1 {Some(c.counters[0].tag.clone())}else{None},"channels":1,"sample_rate_hz":"SET_NOMINAL_RATE","units":"adc_counts_u8"}}));
+        }
+        if result.limit_reached {
+            println!("Capture stopped at --max-bytes limit.");
+        }
+        println!(
+            "{}",
+            if result.suggests_tagged_u8() {
+                "Repeated structure suggests --protocol tagged-u8; this is not proof of framing or hardware sample rate."
+            } else {
+                "Insufficient consistent framing to recommend a protocol."
+            }
+        );
+        return Ok(());
+    }
     if matches!(
         cli.command,
         Some(Action::Ports) | Some(Action::Config { .. })
@@ -84,7 +134,7 @@ fn run() -> Result<()> {
             return Err("Параметры записи/каналов/длительности применимы только к demo, live и replay; удалите их из команды".into());
         }
         if let Some(Action::Ports) = cli.command {
-            let ports = source::list_ports()?;
+            let ports = source::describe_ports()?;
             if ports.is_empty() {
                 println!("No serial ports detected");
             }
@@ -355,8 +405,8 @@ fn run() -> Result<()> {
             config.processing.hop_samples
         ),
     );
-    if config.source.mode == "serial-test" {
-        let warning="LIVE uses serial-test, a TEST text protocol. It is NOT a confirmed Bitronics protocol.";
+    if matches!(config.source.mode.as_str(), "serial" | "serial-test") {
+        let warning="LIVE: nominal sample rate; reconstructed host-side timestamps, no hardware synchronization. Close Arduino Serial Monitor; opening the port may reset UNO.";
         eprintln!("{warning}");
         logger.write(LogLevel::Warn, warning);
     }
@@ -419,6 +469,14 @@ fn run() -> Result<()> {
         logger
     });
     let started = Instant::now();
+    // Serial reset grace is setup time, not part of the requested recording duration.
+    let duration_limit = cli.duration.map(|d| {
+        d + if matches!(config.source.mode.as_str(), "serial" | "serial-test") {
+            config.source.serial_startup_delay_ms as f64 / 1000.
+        } else {
+            0.
+        }
+    });
     let result = if cli.headless {
         loop {
             if runtime
@@ -427,9 +485,7 @@ fn run() -> Result<()> {
                 .unwrap_or_else(|p| p.into_inner())
                 .finished
                 || runtime.stop.load(Ordering::Relaxed)
-                || cli
-                    .duration
-                    .is_some_and(|d| started.elapsed().as_secs_f64() >= d)
+                || duration_limit.is_some_and(|d| started.elapsed().as_secs_f64() >= d)
             {
                 break;
             }
@@ -437,7 +493,7 @@ fn run() -> Result<()> {
         }
         Ok(())
     } else {
-        if let Some(duration) = cli.duration {
+        if let Some(duration) = duration_limit {
             let stop = runtime.stop.clone();
             thread::spawn(move || {
                 let start = Instant::now();

@@ -50,7 +50,7 @@ pub struct Cli {
 pub enum Action {
     /// Воспроизводимый синтетический сигнал без оборудования
     Demo,
-    /// Последовательный порт: ТЕСТОВЫЙ протокол, не подтверждённый Bitronics
+    /// Последовательный порт с протоколом csv или tagged-u8
     Live {
         /// Один порт с 1/2 каналами или два порта по одному каналу
         #[arg(long, value_name = "PORT")]
@@ -58,6 +58,31 @@ pub enum Action {
         /// Скорость порта; по умолчанию из конфигурации (115200)
         #[arg(long,value_parser=clap::value_parser!(u32).range(1..))]
         baud: Option<u32>,
+        #[arg(long, value_parser = ["csv", "tagged-u8"])]
+        protocol: Option<String>,
+        /// Номинальная частота кадров, не измеренная устройством
+        #[arg(long)]
+        sample_rate: Option<f64>,
+        #[arg(long)]
+        units: Option<String>,
+        /// Дополнительное время ожидания после открытия/reset UNO
+        #[arg(long)]
+        startup_delay_ms: Option<u64>,
+    },
+    /// Сохранить ограниченный дамп Serial без DSP и без отправки команд
+    Probe {
+        #[arg(long)]
+        port: String,
+        #[arg(long, default_value_t = 115200, value_parser=clap::value_parser!(u32).range(1..))]
+        baud: u32,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long, default_value_t = 2000, value_parser=clap::value_parser!(u64).range(0..=60000))]
+        startup_delay_ms: u64,
+        #[arg(long, default_value_t = 67108864, value_parser=clap::value_parser!(u64).range(1..=1073741824))]
+        max_bytes: u64,
     },
     /// Воспроизвести сеанс LEMON, CSV, DAT, DMOV или каталог BiTronics
     Replay {
@@ -323,8 +348,35 @@ pub fn resolve(
     }
     match &cli.command {
         None | Some(Action::Demo) => experiment.source.mode = "synthetic".into(),
-        Some(Action::Live { port, baud }) => {
-            experiment.source.mode = "serial-test".into();
+        Some(Action::Live {
+            port,
+            baud,
+            protocol,
+            sample_rate,
+            units,
+            startup_delay_ms,
+        }) => {
+            experiment.source.mode = "serial".into();
+            if let Some(protocol) = protocol {
+                experiment.source.serial_protocol = protocol.clone();
+            }
+            if let Some(rate) = sample_rate {
+                experiment.source.sample_rate_hz = *rate;
+            }
+            if let Some(delay) = startup_delay_ms {
+                experiment.source.serial_startup_delay_ms = *delay;
+            }
+            if let Some(units) = units {
+                experiment.source.units = Some(units.clone());
+            }
+            if experiment.source.serial_protocol == "tagged-u8" {
+                if sample_rate.is_none() && config_path.is_none() {
+                    return Err("tagged-u8: nominal rate is unknown; pass --sample-rate 333.333 (for a 3000 us timer)".into());
+                }
+                if experiment.source.units.is_none() {
+                    experiment.source.units = Some("adc_counts_u8".into());
+                }
+            }
             if !port.is_empty() {
                 experiment.source.ports = port.clone();
             }
@@ -332,7 +384,11 @@ pub fn resolve(
                 experiment.source.baud_rate = *baud;
             }
             if cli.channels.is_none() && config_path.is_none() {
-                experiment.source.channels = experiment.source.ports.len().max(1);
+                experiment.source.channels = if experiment.source.serial_protocol == "tagged-u8" {
+                    2
+                } else {
+                    experiment.source.ports.len().max(1)
+                };
             }
             if experiment.source.ports.len() == 2 {
                 if cli.channels == Some(1) {
@@ -423,7 +479,7 @@ pub fn legacy_hint(args: &[String]) -> Option<&'static str> {
     if args
         .iter()
         .any(|a| a == "--port" || a.starts_with("--port="))
-        && !args.iter().any(|a| a == "live")
+        && !args.iter().any(|a| matches!(a.as_str(), "live" | "probe"))
     {
         return Some("Используйте lemon live --port PORT [--baud 115200].");
     }

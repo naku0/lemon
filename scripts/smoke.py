@@ -119,7 +119,7 @@ def tui_run(config, exit_key, record):
         wait_for(master, output, "Waveform")
         os.write(master, b"6")
         wait_for(master, output, "TUI FPS")
-        os.write(master, b"\x1b[B" * 9 + b"\x1b[C")
+        os.write(master, b"\x1b[B" * 5 + b"\x1b[C")
         wait_for(master, output, "Light")
         os.write(master, b"s")
         wait_for(master, output, "Settings saved")
@@ -253,7 +253,7 @@ def main():
         sessions = list((tmp / "recordings").iterdir())
         serial_events = []
         for item in sessions:
-            if json.loads((item / "metadata.json").read_text())["config"]["source"]["mode"] == "serial-test":
+            if json.loads((item / "metadata.json").read_text())["config"]["source"]["mode"] in ("serial", "serial-test"):
                 with (item / "events.csv").open() as f:
                     serial_events = list(csv.DictReader(f))
         assert any(e["kind"] == "InvalidPacket" for e in serial_events)

@@ -121,6 +121,11 @@ pub(crate) fn colab(
     limit: u64,
     book: &mut Notebook,
 ) -> Result<Value, ReportError> {
+    book.metadata["kernelspec"] = json!({
+        "display_name": "Python 3",
+        "language": "python",
+        "name": "python3"
+    });
     let mut bins = 1200;
     let dataset_path = root.join("report-dataset.json");
     loop {

@@ -57,6 +57,7 @@ enum Overlay {
     Reset,
     Edit(EditTarget, String),
     Summary(RecordingSummary),
+    Details(Field),
 }
 struct View {
     page: usize,
@@ -342,6 +343,11 @@ impl View {
         }
         if let Some(overlay) = self.overlay.take() {
             match overlay {
+                Overlay::Details(field) => {
+                    if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                        self.overlay = Some(Overlay::Details(field));
+                    }
+                }
                 Overlay::Help => {
                     if !matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                         self.overlay = Some(Overlay::Help);
@@ -396,13 +402,17 @@ impl View {
             let field = FIELDS[self.selection];
             let previous = self.settings.clone();
             match key.code {
-                KeyCode::Up => self.selection = self.selection.saturating_sub(1),
-                KeyCode::Down => self.selection = (self.selection + 1).min(FIELDS.len() - 1),
+                KeyCode::Up => self.selection = field.navigate(-1),
+                KeyCode::Down => self.selection = field.navigate(1),
+                KeyCode::Char('[') | KeyCode::PageUp => self.selection = field.next_category(-1),
+                KeyCode::Char(']') | KeyCode::PageDown => self.selection = field.next_category(1),
                 KeyCode::Left => field.adjust(&mut self.settings, -1),
                 KeyCode::Right | KeyCode::Char(' ') => field.adjust(&mut self.settings, 1),
                 KeyCode::Enter => {
-                    if field.group() == 5 {
-                        self.message = field.hint().into();
+                    if field == Field::Reset {
+                        self.overlay = Some(Overlay::Reset);
+                    } else if field.group() == 5 {
+                        self.overlay = Some(Overlay::Details(field));
                     } else if field.text() {
                         self.overlay = Some(Overlay::Edit(
                             EditTarget::Setting(field),
@@ -702,5 +712,40 @@ mod tests {
             f.adjust(&mut s, 1);
         }
         assert_eq!(s, before);
+    }
+    #[test]
+    fn settings_categories_keep_fields_accessible_and_lock_acquisition() {
+        let mut v = view();
+        v.page = 5;
+        let (tx, _) = std::sync::mpsc::sync_channel(1);
+        let config = Config::default();
+        let status = RuntimeStatus {
+            recording_active: true,
+            ..RuntimeStatus::default()
+        };
+        for category in 0..5 {
+            assert_eq!(FIELDS[v.selection].category(), category);
+            let count = FIELDS.iter().filter(|f| f.category() == category).count();
+            let mut visited = Vec::new();
+            for _ in 0..count {
+                visited.push(v.selection);
+                v.key(KeyEvent::from(KeyCode::Down), &status, &tx, &config);
+            }
+            visited.sort();
+            visited.dedup();
+            assert_eq!(visited.len(), count);
+            v.key(KeyEvent::from(KeyCode::Char(']')), &status, &tx, &config);
+        }
+        let before = v.settings.clone();
+        v.selection = FIELDS
+            .iter()
+            .position(|f| *f == Field::Quality)
+            .expect("quality");
+        v.key(KeyEvent::from(KeyCode::Right), &status, &tx, &config);
+        v.key(KeyEvent::from(KeyCode::Enter), &status, &tx, &config);
+        assert!(matches!(v.overlay, Some(Overlay::Details(Field::Quality))));
+        v.key(KeyEvent::from(KeyCode::Esc), &status, &tx, &config);
+        assert!(v.overlay.is_none());
+        assert_eq!(v.settings, before);
     }
 }

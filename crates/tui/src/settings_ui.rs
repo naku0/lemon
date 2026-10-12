@@ -44,8 +44,15 @@ pub enum Field {
     FftWindow,
     FftHop,
     BandBounds,
+    Source,
+    AcquisitionChannels,
+    SerialReplay,
+    SessionMetadata,
+    Quality,
+    Diagnostics,
+    Reset,
 }
-pub const FIELDS: [Field; 41] = [
+pub const FIELDS: [Field; 48] = [
     Field::Fps,
     Field::StartTab,
     Field::Confirm,
@@ -87,6 +94,20 @@ pub const FIELDS: [Field; 41] = [
     Field::FftWindow,
     Field::FftHop,
     Field::BandBounds,
+    Field::Source,
+    Field::AcquisitionChannels,
+    Field::SerialReplay,
+    Field::SessionMetadata,
+    Field::Quality,
+    Field::Diagnostics,
+    Field::Reset,
+];
+pub const CATEGORIES: [&str; 5] = [
+    "Appearance",
+    "Recording",
+    "Acquisition",
+    "Processing",
+    "Advanced",
 ];
 pub const GROUPS: [&str; 6] = [
     "General",
@@ -97,6 +118,62 @@ pub const GROUPS: [&str; 6] = [
     "Advanced (read only)",
 ];
 impl Field {
+    pub fn category(self) -> usize {
+        match self {
+            Self::Directory
+            | Self::SessionName
+            | Self::CreateDir
+            | Self::Summary
+            | Self::SessionMetadata => 1,
+            Self::Source | Self::AcquisitionChannels | Self::SerialReplay => 2,
+            Self::HighPass
+            | Self::LowPass
+            | Self::Notch
+            | Self::NotchHz
+            | Self::FftWindow
+            | Self::FftHop
+            | Self::BandBounds
+            | Self::Quality => 3,
+            Self::Diagnostics | Self::Reset => 4,
+            _ => 0,
+        }
+    }
+    pub fn section(self) -> &'static str {
+        match self {
+            Self::SessionMetadata | Self::SessionName => "Session metadata",
+            Self::Source | Self::AcquisitionChannels | Self::SerialReplay => {
+                "Source / channels / transport"
+            }
+            Self::Quality => "Quality thresholds (engineering heuristic)",
+            Self::Diagnostics | Self::Reset => "Diagnostics / reset",
+            _ => match self.group() {
+                0 => "Interface",
+                2 => "Theme / colors",
+                3 => "Charts / Waveform",
+                4 => "Charts / Spectrum and Bands",
+                5 => "Filters / Spectrum / Bands (read only)",
+                n => GROUPS[n],
+            },
+        }
+    }
+    pub fn navigate(self, delta: isize) -> usize {
+        let indices: Vec<_> = FIELDS
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.category() == self.category())
+            .map(|(i, _)| i)
+            .collect();
+        let pos = indices.iter().position(|&i| FIELDS[i] == self).unwrap_or(0);
+        indices[pos.saturating_add_signed(delta).min(indices.len() - 1)]
+    }
+    pub fn next_category(self, delta: isize) -> usize {
+        let category =
+            (self.category() as isize + delta).rem_euclid(CATEGORIES.len() as isize) as usize;
+        FIELDS
+            .iter()
+            .position(|f| f.category() == category)
+            .unwrap_or(0)
+    }
     pub fn group(self) -> usize {
         match self {
             Self::Fps | Self::StartTab | Self::Confirm | Self::Unicode | Self::Compact => 0,
@@ -168,6 +245,13 @@ impl Field {
             Self::FftWindow => "FFT window, samples",
             Self::FftHop => "FFT hop, samples",
             Self::BandBounds => "Frequency bands, Hz",
+            Self::Source => "Source / nominal sample rate",
+            Self::AcquisitionChannels => "Input channels / units",
+            Self::SerialReplay => "Serial / replay options",
+            Self::SessionMetadata => "Session metadata",
+            Self::Quality => "Quality thresholds",
+            Self::Diagnostics => "Version / block size",
+            Self::Reset => "Reset preferences",
         }
     }
     pub fn text(self) -> bool {
@@ -188,9 +272,13 @@ impl Field {
     }
     pub fn hint(self) -> &'static str {
         match self {
+            Self::Reset => "Ctrl+R opens reset confirmation; Esc cancels. S saves preferences.",
+            Self::Diagnostics => "Read only; effective launch configuration. No acquisition settings are modified here.",
+            Self::Source | Self::AcquisitionChannels | Self::SerialReplay => "Read only; change CLI/experiment JSON on next launch. Active acquisition is unchanged.",
+            Self::SessionMetadata => "Read only here; edit the Recording screen for the next recording.",
             Self::StartTab => "Next launch; save with S",
             Self::GapTolerance => "New incoming samples; display only, does not change DSP",
-            Self::WaveStyle => "Line/Points/Envelope; manual selection disables auto envelope",
+            Self::WaveStyle => "Immediate, display only: Line/Points/Envelope; manual selection disables auto envelope",
             Self::Directory | Self::SessionName | Self::CreateDir => {
                 "Next recording; active session is unchanged"
             }
@@ -247,6 +335,40 @@ impl Field {
                 .map(|b| format!("{} {}-{}", b.name, b.low_hz, b.high_hz))
                 .collect::<Vec<_>>()
                 .join("; "),
+            Self::Source => format!("{} / {} Hz", c.source.mode, c.source.sample_rate_hz),
+            Self::AcquisitionChannels => format!(
+                "{} / {}",
+                c.source.channels,
+                c.source.units.as_deref().unwrap_or("a.u.")
+            ),
+            Self::SerialReplay => format!(
+                "{} @ {} baud; ports {}; replay {} x{}",
+                c.source.serial_protocol,
+                c.source.baud_rate,
+                c.source.ports.join(", "),
+                c.source.replay_path,
+                c.source.replay_speed
+            ),
+            Self::SessionMetadata => format!(
+                "{}; electrodes {}; {}",
+                c.session.name,
+                c.session.electrodes.join(", "),
+                c.session.notes
+            ),
+            Self::Quality => format!(
+                "abs max {}; step {}; flat std {}; mains ratio {}; sync {} ms",
+                c.processing.expected_abs_max,
+                c.processing.outlier_step,
+                c.processing.flat_stddev,
+                c.processing.mains_ratio_limit,
+                c.processing.sync_tolerance_ms
+            ),
+            Self::Diagnostics => format!(
+                "LEMON {}; {} samples/block",
+                env!("CARGO_PKG_VERSION"),
+                c.source.block_size
+            ),
+            Self::Reset => "R: current preference group; Ctrl+R: all (confirm)".into(),
         }
     }
     pub fn set(self, s: &mut Settings, text: &str) -> Result<()> {

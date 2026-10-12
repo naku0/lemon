@@ -72,36 +72,131 @@ fn cell(kind: &str, text: &str) -> Cell {
         execution_count: (kind == "code").then_some(Value::Null),
     }
 }
-fn notebook() -> Notebook {
-    let mut cells = vec![cell("markdown", "# LEMON Signal Report\n\n**LEMON — Lightweight EEG Monitoring Of Neuroactivity**\n\nThis report presents numerical characteristics and visualizations of the recorded signal. Neurophysiological, cognitive and medical interpretation must be performed by a qualified specialist."), cell("code", include_str!("../python/presentation.py")), cell("code", "initialize()")];
-    for (i, (title, call)) in [
-        ("Recording overview", "overview()"),
-        ("Import and data provenance", "provenance()"),
-        ("Processing performed", "processing()"),
-        ("Raw signal", "waveform('raw')"),
-        ("Filtered signal", "waveform('filtered')"),
-        ("Raw and filtered comparison", "comparison()"),
-        ("Power spectral density", "spectrum()"),
-        ("Frequency-band power", "bands()"),
-        ("Signal continuity and quality", "quality()"),
-        ("Technical summary", "technical_summary()"),
-        ("Warnings and limitations", "warnings()"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        cells.push(cell("markdown", &format!("## {}. {}", i + 1, title)));
-        cells.push(cell("code", call));
+fn python_cell(name: &str) -> Result<&'static str, ReportError> {
+    const SOURCE: &str = include_str!("../python/presentation.py");
+    let marker = format!("# %% LEMON CELL: {name}\n");
+    let start = SOURCE
+        .find(&marker)
+        .ok_or_else(|| format!("report/notebook: missing Python cell {name}"))?
+        + marker.len();
+    let end = SOURCE[start..]
+        .find("# %% LEMON CELL: ")
+        .map_or(SOURCE.len(), |offset| start + offset);
+    Ok(SOURCE[start..end].trim())
+}
+fn markdown_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+        .replace('`', "\\`")
+}
+fn basename(value: &str) -> String {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
+        .to_string()
+}
+fn report_information(analysis: &AnalysisBundle, created_at: &str) -> Result<String, ReportError> {
+    let manifest: Value = serde_json::from_reader(
+        fs::File::open(analysis.directory.join("manifest.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let summary: Value = serde_json::from_reader(
+        fs::File::open(analysis.directory.join("summary.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let source = manifest["source_path"]
+        .as_str()
+        .or_else(|| manifest["source"].as_str())
+        .unwrap_or("analysis");
+    let name = markdown_escape(&basename(source));
+    let files = manifest["source_metadata"]["provenance"]["files_used"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(basename)
+                .map(|value| markdown_escape(&value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| name.clone());
+    let channels = manifest["channels"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(markdown_escape)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let duration = summary["duration_seconds"]
+        .as_f64()
+        .map_or_else(|| "unknown".into(), |value| format!("{value:.3} s"));
+    let sample_rate = manifest["sample_rate_hz"]
+        .as_f64()
+        .map_or_else(|| "unknown".into(), |value| format!("{value:.6} Hz"));
+    let units = markdown_escape(manifest["units"].as_str().unwrap_or("a.u."));
+    let source_format = markdown_escape(manifest["source_format"].as_str().unwrap_or("unknown"));
+    let rate_source = markdown_escape(manifest["sample_rate_source"].as_str().unwrap_or("unknown"));
+    Ok(format!(
+        "# Signal analysis: {name}\n\n## 1. Report information\n\n| Field | Value |\n|---|---|\n| Source file(s) | {files} |\n| Source format | {source_format} |\n| Duration | {duration} |\n| Channels | {channels} |\n| Sample rate | {sample_rate} |\n| Sample-rate source | {rate_source} |\n| Units | {units} |\n| Report created | {created_at} |"
+    ))
+}
+fn notebook(analysis: &AnalysisBundle, created_at: &str) -> Result<Notebook, ReportError> {
+    let mut cells = vec![cell("markdown", &report_information(analysis, created_at)?)];
+    let sections: &[(&str, &[&str])] = &[
+        ("2. Imports", &["IMPORTS"]),
+        ("3. User settings", &["USER_SETTINGS"]),
+        ("4. Load analysis data", &["LOAD_DATA"]),
+        ("5. Available datasets", &["AVAILABLE_DATASETS"]),
+        ("6. Recording overview", &["OVERVIEW"]),
+        ("7. Raw signal", &["SIGNAL_FUNCTIONS", "RAW"]),
+        ("8. Filtered signal", &["FILTERED"]),
+        ("9. Raw versus filtered", &["COMPARISON"]),
+        ("10. Power spectral density", &["PSD_FUNCTIONS", "PSD"]),
+        ("11. Frequency-band power", &["BAND_FUNCTIONS", "BANDS"]),
+        (
+            "12. Signal continuity and quality",
+            &["QUALITY_FUNCTIONS", "QUALITY"],
+        ),
+        ("13. Processing details", &["PROCESSING"]),
+        ("14. Warnings and limitations", &["WARNINGS"]),
+        (
+            "15. Further research",
+            &[
+                "FURTHER_SELECT",
+                "FURTHER_CUSTOM",
+                "FURTHER_COMPARE",
+                "FURTHER_EXPORT",
+            ],
+        ),
+    ];
+    for (title, code_cells) in sections {
+        cells.push(cell("markdown", &format!("## {title}")));
+        for name in *code_cells {
+            cells.push(cell("code", python_cell(name)?));
+        }
     }
+    cells.push(cell(
+        "markdown",
+        "## 16. Footer\n\n*auto-generated by LEMON*",
+    ));
     for (i, c) in cells.iter_mut().enumerate() {
         c.id = format!("lemon-{i}");
     }
-    Notebook {
+    Ok(Notebook {
         cells,
-        metadata: json!({"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"},"language_info":{"name":"python"}}),
+        metadata: json!({"kernelspec":{"display_name":environment::KERNEL_DISPLAY_NAME,"language":"python","name":environment::KERNEL_NAME},"language_info":{"name":"python"}}),
         nbformat: 4,
         nbformat_minor: 5,
-    }
+    })
 }
 
 #[derive(Serialize)]
@@ -227,10 +322,25 @@ os.replace(tmp,path)"#;
         Err(format!("{diagnostic}\nFull log: {}", log_path.display()))
     }
 }
+fn generated_figures(output: &Path) -> Result<Vec<String>, ReportError> {
+    let directory = output.join("figures");
+    let mut figures = Vec::new();
+    for entry in fs::read_dir(&directory).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().map_err(|e| e.to_string())?.is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("png")
+        {
+            figures.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    figures.sort();
+    Ok(figures)
+}
 #[allow(clippy::too_many_arguments)]
 fn write_manifest(
     output: &Path,
     analysis: &AnalysisBundle,
+    created_at: &str,
     status: &str,
     mode: &str,
     python: Option<&Path>,
@@ -243,12 +353,7 @@ fn write_manifest(
         report_format_version: 1,
         lemon_version: env!("CARGO_PKG_VERSION").into(),
         notebook_nbformat: 4,
-        created_at: format!(
-            "unix-ms:{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |x| x.as_millis())
-        ),
+        created_at: created_at.into(),
         analysis_manifest_path: {
             let settings: Value = serde_json::from_slice(
                 &fs::read(output.join("report-data.json")).map_err(|e| e.to_string())?,
@@ -265,18 +370,7 @@ fn write_manifest(
         python_executable: python.map(|x| x.display().to_string()),
         python_version: version,
         dependency_versions: deps,
-        generated_figures: [
-            "raw-overview.png",
-            "filtered-overview.png",
-            "raw-filtered-comparison.png",
-            "spectrum.png",
-            "band-power-history.png",
-            "quality-timeline.png",
-        ]
-        .iter()
-        .filter(|name| output.join("figures").join(name).is_file())
-        .map(|x| (*x).into())
-        .collect(),
+        generated_figures: generated_figures(output)?,
         warnings,
     };
     let tmp = path.with_extension("json.partial");
@@ -299,6 +393,17 @@ fn report_dir(analysis: &AnalysisBundle, requested: Option<&Path>) -> PathBuf {
                 .unwrap_or("analysis")
         ))
     })
+}
+fn allowed_figure(name: &str) -> bool {
+    matches!(
+        name,
+        "raw-overview.png"
+            | "filtered-overview.png"
+            | "raw-filtered-comparison.png"
+            | "spectrum.png"
+            | "quality-distribution.png"
+            | "quality-timeline.png"
+    ) || (name.starts_with("band-power-") && name.ends_with(".png"))
 }
 
 pub fn render_notebook(
@@ -404,8 +509,10 @@ pub fn render_notebook(
                 }
                 for e in fs::read_dir(&dir).map_err(|e| e.to_string())? {
                     let e = e.map_err(|e| e.to_string())?;
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
                     let allowed = if sub == "analysis" {
-                        vec![
+                        [
                             "manifest.json",
                             "summary.json",
                             "summary.md",
@@ -414,19 +521,11 @@ pub fn render_notebook(
                             "band-power.csv",
                             "quality-events.csv",
                         ]
+                        .contains(&name.as_ref())
                     } else {
-                        vec![
-                            "raw-overview.png",
-                            "filtered-overview.png",
-                            "raw-filtered-comparison.png",
-                            "spectrum.png",
-                            "band-power-history.png",
-                            "quality-timeline.png",
-                        ]
+                        allowed_figure(&name)
                     };
-                    if !e.file_type().map_err(|e| e.to_string())?.is_file()
-                        || !allowed.contains(&e.file_name().to_string_lossy().as_ref())
-                    {
+                    if !e.file_type().map_err(|e| e.to_string())?.is_file() || !allowed {
                         return Err("report/output: unrelated files inside existing report".into());
                     }
                 }
@@ -447,7 +546,13 @@ pub fn render_notebook(
         b"{\"analysis_path\":\"analysis\"}",
     )
     .map_err(|e| e.to_string())?;
-    let mut book = notebook();
+    let created_at = format!(
+        "unix-ms:{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |value| value.as_millis())
+    );
+    let mut book = notebook(analysis, &created_at)?;
     let colab_metadata = if options.colab {
         Some(packaging::colab(
             &output,
@@ -534,6 +639,7 @@ pub fn render_notebook(
     let manifest = write_manifest(
         &output,
         analysis,
+        &created_at,
         status,
         mode,
         Some(&python),

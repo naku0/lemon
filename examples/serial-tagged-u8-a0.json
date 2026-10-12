@@ -1,0 +1,17 @@
+{
+  "source": {
+    "mode": "serial",
+    "ports": [],
+    "baud_rate": 115200,
+    "sample_rate_hz": 333.333333,
+    "channels": 2,
+    "block_size": 25,
+    "units": "adc_counts_u8",
+    "serial_protocol": "tagged-u8",
+    "serial_frame_tags": ["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A9"],
+    "serial_channel_tags": ["A0", "A1"],
+    "serial_sequence_tag": "A9",
+    "serial_startup_delay_ms": 2000,
+    "serial_idle_timeout_ms": 3000
+  }
+}

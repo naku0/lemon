@@ -63,7 +63,7 @@ impl Runtime {
         });
         let source_stop = stop.clone();
         let source_disconnect = disconnect.clone();
-        let serial = config.source.mode == "serial-test";
+        let serial = matches!(config.source.mode.as_str(), "serial" | "serial-test");
         let acquisition = thread::spawn(move || {
             while !source_stop.load(Ordering::Relaxed) && !source_disconnect.load(Ordering::Relaxed)
             {
@@ -84,6 +84,11 @@ impl Runtime {
                     }
                 }
                 if finished {
+                    break;
+                }
+            }
+            for item in source.finish() {
+                if source_tx.send(Ok(item)).is_err() {
                     break;
                 }
             }

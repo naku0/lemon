@@ -22,6 +22,8 @@ pub struct Options {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provenance {
+    #[serde(default, flatten)]
+    pub details: std::collections::BTreeMap<String, serde_json::Value>,
     pub original_format: String,
     pub original_path: String,
     pub importer_version: String,
@@ -710,6 +712,7 @@ pub fn import(
         metadata.format_version = 2;
         if metadata.provenance.is_none() {
             metadata.provenance = Some(Provenance {
+                details: Default::default(),
                 original_format: "lemon-session".into(),
                 original_path: input.display().to_string(),
                 importer_version: env!("CARGO_PKG_VERSION").into(),
@@ -741,6 +744,13 @@ pub fn import(
         }
         writer.flush()?;
         return Ok(writer.directory);
+    }
+    if input
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("dmov"))
+        && (crate::dmov::recognized(input)? || discover(input).is_err())
+    {
+        return crate::dmov::import(input, output, parent, options, config);
     }
     let (files, duplicates, format) = discover(input)?;
     if !options.channel_names.is_empty()
@@ -838,6 +848,7 @@ pub fn import(
     meta.channel_ids = names.clone();
     meta.units = options.units.clone();
     meta.provenance = Some(Provenance {
+        details: Default::default(),
         original_format: format.clone(),
         original_path: input.display().to_string(),
         importer_version: env!("CARGO_PKG_VERSION").into(),

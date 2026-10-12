@@ -1,7 +1,7 @@
 use super::{EditTarget, Overlay, View};
 use crate::{
-    settings::{Palette, PowerMode, WaveMode, WaveStyle},
-    settings_ui::{FIELDS, GROUPS},
+    settings::{nearest_xterm, xterm_rgb, Palette, PowerMode, WaveMode, WaveStyle},
+    settings_ui::{CATEGORIES, FIELDS},
 };
 use core_types::*;
 use ratatui::{
@@ -55,6 +55,7 @@ fn brightness(color: Color, background: Color, amount: f64) -> Color {
             Color::Magenta => (188, 63, 188),
             Color::Cyan => (17, 168, 205),
             Color::Rgb(r, g, b) => (r, g, b),
+            Color::Indexed(index) => xterm_rgb(index),
             _ => return None,
         })
     }
@@ -64,7 +65,12 @@ fn brightness(color: Color, background: Color, amount: f64) -> Color {
     match (rgb(color), rgb(background)) {
         (Some((r, g, b)), Some((br, bg, bb))) => {
             let blend = |a: u8, b: u8| (b as f64 + (a as f64 - b as f64) * amount).round() as u8;
-            Color::Rgb(blend(r, br), blend(g, bg), blend(b, bb))
+            let mixed = (blend(r, br), blend(g, bg), blend(b, bb));
+            if matches!((color, background), (Color::Indexed(_), Color::Indexed(_))) {
+                Color::Indexed(nearest_xterm(mixed))
+            } else {
+                Color::Rgb(mixed.0, mixed.1, mixed.2)
+            }
         }
         _ => color,
     }
@@ -139,7 +145,7 @@ pub(super) fn draw(
     .split(area);
     let mode = match config.source.mode.as_str() {
         "synthetic" => "DEMO",
-        "serial-test" => "LIVE / TEST",
+        "serial" | "serial-test" => "LIVE",
         "replay" => "REPLAY",
         _ => "SOURCE",
     };
@@ -231,7 +237,7 @@ pub(super) fn draw(
         2 => "C Channel  Settings: linear/log PSD",
         3 => "P Absolute/Relative/Baseline  C Channel",
         4 => "Up/Down Select field  Enter Edit (before recording)",
-        _ => "Ctrl+R Reset all (confirmation) | Advanced is read only",
+        _ => "[/] or PgUp/PgDn: Category | Ctrl+R Reset all | Acquisition/DSP locked",
     };
     let message = status.fatal_error.as_ref().unwrap_or(&v.message);
     f.render_widget(
@@ -270,7 +276,7 @@ fn sources(
         .as_ref()
         .and_then(|b| b.skew_ms)
         .map_or("unknown".into(), |x| format!("{x:.2} ms"));
-    para(f,area,"Sources",format!("LEMON — Lightweight EEG Monitoring Of Neuroactivity\n\nMode: {}\nPorts: {}\nSelected: {:?}\nChannels: {} | nominal: {} Hz | arrival: {:.1} samples/s/channel\nSamples: {} | blocks: {} | lost: {} | errors: {} | outliers: {}\nChannel skew: {}\nDisplay dropped: {} | consumer blocks: {} | consumer dropped: {}\n\n{}\n\nQuality: {:?}",c.source.mode,if ports.is_empty(){"No serial ports detected".into()}else{ports.join(", ")},c.source.ports,c.source.channels,c.source.sample_rate_hz,s.rate_hz,s.received_samples,s.processed_blocks,s.lost_samples,s.errors,s.outliers,skew,dropped,s.consumer_blocks,s.consumer_dropped,if c.source.mode=="serial-test"{"TEST protocol only. Bitronics protocol is NOT confirmed. Host timestamps do not synchronize devices."}else{"Raw recording and processing continue independently of display refresh and pause."},(0..c.source.channels).map(|i|quality(v,s,i)).collect::<Vec<_>>()),v);
+    para(f,area,"Sources",format!("LEMON — Lightweight EEG Monitoring Of Neuroactivity\n\nMode: {}\nPorts: {}\nSelected: {:?}\nChannels: {} | nominal: {} Hz | arrival: {:.1} samples/s/channel\nSamples: {} | blocks: {} | lost: {} | errors: {} | outliers: {}\nChannel skew: {}\nDisplay dropped: {} | consumer blocks: {} | consumer dropped: {}\n\n{}\n\nQuality: {:?}",c.source.mode,if ports.is_empty(){"No serial ports detected".into()}else{ports.join(", ")},c.source.ports,c.source.channels,c.source.sample_rate_hz,s.rate_hz,s.received_samples,s.processed_blocks,s.lost_samples,s.errors,s.outliers,skew,dropped,s.consumer_blocks,s.consumer_dropped,if matches!(c.source.mode.as_str(), "serial" | "serial-test"){"Serial protocol from configuration. Nominal rate; reconstructed timestamps do not synchronize devices."}else{"Raw recording and processing continue independently of display refresh and pause."},(0..c.source.channels).map(|i|quality(v,s,i)).collect::<Vec<_>>()),v);
 }
 fn waveform(f: &mut Frame, area: Rect, v: &View, status: &RuntimeStatus, c: &Config, p: &Palette) {
     let indices: Vec<_> = (0..v.history.len()).filter(|i| v.selected(*i)).collect();
@@ -776,43 +782,144 @@ fn settings(f: &mut Frame, area: Rect, v: &View, c: &Config, p: &Palette) {
     let title = format!(
         "Settings{} | {}",
         if v.dirty { " * unsaved" } else { "" },
-        GROUPS[field.group()]
+        CATEGORIES[field.category()]
     );
     let frame = panel(title, v);
     let inner = frame.inner(area);
     f.render_widget(frame, area);
-    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
-    let rows = parts[0].height as usize;
-    let start = v
-        .selection
-        .saturating_sub(rows.saturating_sub(1) / 2)
-        .min(FIELDS.len().saturating_sub(rows));
-    let lines: Vec<Line> = FIELDS
+    if inner.height < 10 {
+        f.render_widget(
+            Paragraph::new(format!(
+                "[/] {}\n> {}\n{}\n{}",
+                CATEGORIES[field.category()],
+                field.name(),
+                field.value(&v.settings, c),
+                field.hint()
+            ))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(inner);
+    let (categories, content) = if inner.width >= 88 {
+        let split =
+            Layout::horizontal([Constraint::Length(20), Constraint::Min(1)]).split(parts[0]);
+        (split[0], split[1])
+    } else {
+        let split = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(parts[0]);
+        (split[0], split[1])
+    };
+    let navigation: Vec<Line> = if inner.width >= 88 {
+        CATEGORIES
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Line::from(format!(
+                    "{} {}",
+                    if i == field.category() { ">" } else { " " },
+                    name
+                ))
+                .style(Style::default().fg(if i == field.category() {
+                    p.accent
+                } else {
+                    p.text
+                }))
+            })
+            .collect()
+    } else {
+        [0..3, 3..5]
+            .into_iter()
+            .map(|range| {
+                Line::from(
+                    range
+                        .map(|i| {
+                            Span::styled(
+                                format!(
+                                    "{}{} ",
+                                    if i == field.category() { ">" } else { " " },
+                                    CATEGORIES[i]
+                                ),
+                                Style::default().fg(if i == field.category() {
+                                    p.accent
+                                } else {
+                                    p.text
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    };
+    f.render_widget(
+        Paragraph::new(navigation).block(
+            Block::bordered()
+                .title("Categories")
+                .border_style(Style::default().fg(p.muted)),
+        ),
+        categories,
+    );
+    let body = Block::bordered()
+        .title(format!(" {} ", field.section()))
+        .border_style(Style::default().fg(p.muted));
+    let body_area = body.inner(content);
+    f.render_widget(body, content);
+    let entries: Vec<_> = FIELDS
         .iter()
         .enumerate()
+        .filter(|(_, entry)| entry.category() == field.category())
+        .collect();
+    let selected = entries
+        .iter()
+        .position(|(i, _)| *i == v.selection)
+        .unwrap_or(0);
+    let rows = body_area.height as usize / 2;
+    let start = selected
+        .saturating_sub(rows.saturating_sub(1) / 2)
+        .min(entries.len().saturating_sub(rows));
+    let lines: Vec<Line> = entries
+        .into_iter()
         .skip(start)
         .take(rows)
-        .map(|(i, field)| {
+        .flat_map(|(i, field)| {
             let value = field.value(&v.settings, c);
-            Line::from(format!(
-                "{} {:34} {}",
-                if i == v.selection { ">" } else { " " },
-                field.name(),
-                if value.is_empty() {
-                    "(inherit / all)".into()
-                } else {
-                    value
-                }
-            ))
-            .style(if i == v.selection {
+            let style = if i == v.selection {
                 Style::default().fg(p.accent).bold()
             } else {
-                Style::default().fg(if field.group() == 5 { p.muted } else { p.text })
-            })
+                Style::default().fg(p.text)
+            };
+            [
+                Line::from(format!(
+                    "{} {}{}",
+                    if i == v.selection { ">" } else { " " },
+                    field.name(),
+                    if field.group() == 5 { " [locked]" } else { "" },
+                ))
+                .style(style),
+                Line::from(format!(
+                    "    {}",
+                    if value.is_empty() {
+                        "(inherit / all)".into()
+                    } else {
+                        value
+                    }
+                ))
+                .style(Style::default().fg(p.muted)),
+            ]
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), parts[0]);
-    f.render_widget(Paragraph::new(format!("{}\n{}\n{}",field.hint(),v.settings_path.display(),if v.directory_locked{"Directory overridden by CLI/env; Settings default applies on a later launch without that override."}else{"Theme and history are display-only. DSP requires a restart."})).wrap(Wrap{trim:false}),parts[1]);
+    f.render_widget(Paragraph::new(lines), body_area);
+    f.render_widget(
+        Paragraph::new(format!(
+            "[ / ] or PgUp/PgDn: category | Up/Down: setting\n{}\n{}\n{}",
+            field.hint(),
+            field.name(),
+            field.value(&v.settings, c)
+        ))
+        .wrap(Wrap { trim: false }),
+        parts[1],
+    );
 }
 fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Palette) {
     let Some(overlay) = &v.overlay else {
@@ -823,6 +930,7 @@ fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Pale
     let height = area.height.saturating_sub(2).min(match overlay {
         Overlay::Help => 25,
         Overlay::Summary(_) => 12,
+        Overlay::Details(_) => 20,
         _ => 9,
     });
     let rect = Rect::new(
@@ -832,7 +940,8 @@ fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Pale
         height,
     );
     let (title,text)=match overlay {
-        Overlay::Help=>("LEMON Help",format!("Lightweight EEG Monitoring Of Neuroactivity\n\nTab / 1-6: screen | R: record | M: marker | Space: pause display | Q: quit\nSettings: Up/Down select; Enter edit; Left/Right change; S save; R reset group; Ctrl+R reset all.\nCurrent screen: {}\nWaveform: G Line/Points/Envelope; V raw/filtered/both; C channel; A scale; +/- seconds.\nBands: P absolute/relative/baseline; C channel. Recording: Up/Down, Enter edit.\nSources: D disconnect.\n\nRaw: original samples. Filtered: causal high-pass, low-pass and optional notch.\nTheta, Alpha/Mu and Beta are frequency-component power estimates.\nAlpha and Mu overlap (usually 8-13 Hz); electrode placement and experimental context distinguish them. 8-13 Hz alone is NOT MuERD.\n\nGood / Acceptable / Poor / Disconnected / Unknown: heuristic quality; not a validated clinical metric.\nPause affects display only. Raw recording continues. Gaps and absent baseline are never zeros.\nThis application is NOT a medical device. Bitronics protocol is NOT confirmed.\n\nEsc closes Help; it does not exit LEMON.",["Sources","Waveform","Spectrum","Bands","Recording","Settings"][v.page])),
+        Overlay::Details(field) => ("Setting details (read only)", format!("{}\n\n{}\n\n{}\n\nEnter / Esc: close", field.name(), field.value(&v.settings, c), field.hint())),
+        Overlay::Help=>("LEMON Help",format!("Lightweight EEG Monitoring Of Neuroactivity\n\nTab / 1-6: screen | R: record | M: marker | Space: pause display | Q: quit\nSettings: Up/Down select; Enter edit; Left/Right change; S save; R reset group; Ctrl+R reset all.\nCurrent screen: {}\nWaveform: G Line/Points/Envelope; V raw/filtered/both; C channel; A scale; +/- seconds.\nBands: P absolute/relative/baseline; C channel. Recording: Up/Down, Enter edit.\nSources: D disconnect.\n\nRaw: original samples. Filtered: causal high-pass, low-pass and optional notch.\nTheta, Alpha/Mu and Beta are frequency-component power estimates.\nAlpha and Mu overlap (usually 8-13 Hz); electrode placement and experimental context distinguish them. 8-13 Hz alone is NOT MuERD.\n\nGood / Acceptable / Poor / Disconnected / Unknown: heuristic quality; not a validated clinical metric.\nPause affects display only. Raw recording continues. Gaps and absent baseline are never zeros.\nThis application is NOT a medical device. Serial clocks are reconstructed from the nominal rate; hardware timing is not verified.\n\nEsc closes Help; it does not exit LEMON.",["Sources","Waveform","Spectrum","Bands","Recording","Settings"][v.page])),
         Overlay::Quit=>("Confirm exit",if status.recording_active || v.record_requested{"Запись активна. Остановить запись и выйти?\n[Y] Да  [N] Вернуться\n\nQueued samples will be flushed before exit.".into()}else{"Exit LEMON?\n[Y] Yes  [N] Return".into()}),
         Overlay::Reset=>("Reset all settings","Reset every preference to defaults?\n[Y] Reset  [N] Return\nThis does not change experiment/DSP configuration. Save with S to persist.".into()),
         Overlay::Summary(s)=>("Recording complete",format!("{}\n\nEnter / Esc: close",summary(s))),
@@ -884,6 +993,65 @@ mod tests {
         path::PathBuf,
         sync::{atomic::AtomicBool, Arc},
     };
+    #[test]
+    fn dark_waveform_brightness_stays_in_256_color_space() {
+        let p = Settings::default().appearance.palette();
+        assert!(matches!(
+            brightness(p.raw, p.background, 0.5),
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            brightness(p.filtered, p.background, 0.7),
+            Color::Indexed(_)
+        ));
+    }
+    #[test]
+    fn settings_selected_fields_visible_in_wide_and_compact_layouts() {
+        let c = Config::default();
+        let mut v = View::new(
+            &c,
+            UiOptions {
+                settings: Settings::default(),
+                settings_path: "unused".into(),
+                interrupt: Arc::new(AtomicBool::new(false)),
+                data_directory_locked: false,
+                experiment_directory: c.recording_dir.clone(),
+                experiment_session_name: c.session.name.clone(),
+            },
+        );
+        v.page = 5;
+        for theme in [Theme::Dark, Theme::Light] {
+            v.settings.appearance.theme = theme;
+            for (w, h) in [(160, 42), (80, 24), (52, 14)] {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+                for (i, field) in FIELDS.iter().enumerate() {
+                    v.selection = i;
+                    terminal
+                        .draw(|f| draw(f, &c, &[], &v, &RuntimeStatus::default(), 0))
+                        .expect("draw");
+                    let buffer = terminal.backend().buffer();
+                    let text = buffer
+                        .content
+                        .chunks(w as usize)
+                        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        text.contains(&format!(
+                            "> {}",
+                            field.name().chars().take(20).collect::<String>()
+                        )),
+                        "{w}x{h}: {field:?}\n{text}"
+                    );
+                    if h >= 24 {
+                        for category in CATEGORIES {
+                            assert!(text.contains(category), "{text}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn screens_and_overlay_render_at_small_sizes() {
         let c = Config::default();

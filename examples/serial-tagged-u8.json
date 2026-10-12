@@ -1,0 +1,14 @@
+{
+  "source": {
+    "mode": "serial",
+    "ports": ["/dev/cu.usbmodem1101"],
+    "baud_rate": 115200,
+    "serial_protocol": "tagged-u8",
+    "sample_rate_hz": 333.3333333333333,
+    "channels": 2,
+    "block_size": 25,
+    "units": "adc_counts_u8",
+    "serial_idle_timeout_ms": 3000,
+    "serial_startup_delay_ms": 2000
+  }
+}

@@ -364,6 +364,57 @@ fn raw_recording_and_second_consumer_are_independent_of_tui() {
         assert_eq!(count, 2500);
     }
 }
+
+#[test]
+fn cancellation_drains_source_tail_and_records_raw_before_dsp() {
+    use std::sync::{atomic::AtomicBool, Arc};
+    struct Buffered {
+        polled: Arc<AtomicBool>,
+        tail: Option<RawSignalBlock>,
+    }
+    impl SignalSource for Buffered {
+        fn poll(&mut self) -> Result<SourcePoll> {
+            self.polled.store(true, Ordering::Relaxed);
+            Ok(SourcePoll::Pending)
+        }
+        fn finish(&mut self) -> Vec<SourcePoll> {
+            self.tail
+                .take()
+                .map(SourcePoll::Block)
+                .into_iter()
+                .collect()
+        }
+    }
+    let temp = Temp::new();
+    let mut c = config();
+    c.recording_dir = temp.0.display().to_string();
+    let mut block = tone(0, 3, 0, 10., 255.);
+    block.synchronized_clock = false;
+    block.channels[0].samples[0].value = 255.;
+    let original = block.channels[0].samples.clone();
+    let polled = Arc::new(AtomicBool::new(false));
+    let runtime = app::Runtime::start(
+        c,
+        Box::new(Buffered {
+            polled: polled.clone(),
+            tail: Some(block),
+        }),
+        true,
+    )
+    .expect("runtime");
+    let started = Instant::now();
+    while !polled.load(Ordering::Relaxed) {
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::yield_now();
+    }
+    let status = runtime.shutdown().expect("shutdown");
+    let raw = PathBuf::from(status.recording.expect("recording"));
+    let mut reader = SessionReader::open(raw.parent().expect("parent")).expect("reader");
+    let saved = reader.next_block().expect("read").expect("tail");
+    assert_eq!(saved.channels[0].samples, original);
+    assert!(!saved.synchronized_clock);
+    assert!(reader.next_block().expect("end").is_none());
+}
 #[test]
 fn pipeline_finishes_after_source_disconnect() {
     let mut c = config();

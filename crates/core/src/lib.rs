@@ -240,6 +240,53 @@ pub struct SourceConfig {
     pub replay_speed: f64,
     pub units: Option<String>,
     pub serial_idle_timeout_ms: u64,
+    pub serial_protocol: String,
+    pub serial_frame_tags: Vec<String>,
+    pub serial_channel_tags: Vec<String>,
+    pub serial_sequence_tag: Option<String>,
+    pub serial_startup_delay_ms: u64,
+}
+impl SourceConfig {
+    /// Validate transport fields separately from the selected signal channels.
+    pub fn validate_serial_tags(&self) -> Result<()> {
+        let tags = &self.serial_frame_tags;
+        if tags.is_empty()
+            || tags.len() > 32
+            || tags
+                .iter()
+                .any(|t| t.len() != 2 || !t.bytes().all(|b| b.is_ascii_alphanumeric()))
+        {
+            return Err(
+                "serial_frame_tags: 1..32 unique two-byte ASCII alphanumeric tags required".into(),
+            );
+        }
+        if tags.iter().collect::<std::collections::HashSet<_>>().len() != tags.len() {
+            return Err("serial_frame_tags: duplicate tags are not allowed".into());
+        }
+        if !(1..=2).contains(&self.channels) || self.serial_channel_tags.len() != self.channels {
+            return Err(
+                "serial_channel_tags must contain exactly --channels (1 or 2) signal tags".into(),
+            );
+        }
+        if self.serial_channel_tags.iter().any(|t| !tags.contains(t))
+            || self
+                .serial_channel_tags
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != self.channels
+        {
+            return Err(
+                "serial_channel_tags: choose distinct tags present in serial_frame_tags".into(),
+            );
+        }
+        if let Some(sequence) = &self.serial_sequence_tag {
+            if !tags.contains(sequence) || self.serial_channel_tags.contains(sequence) {
+                return Err("serial_sequence_tag must occur in serial_frame_tags and must not be a signal tag".into());
+            }
+        }
+        Ok(())
+    }
 }
 impl Default for SourceConfig {
     fn default() -> Self {
@@ -273,6 +320,11 @@ impl Default for SourceConfig {
             replay_speed: 1.,
             units: None,
             serial_idle_timeout_ms: 3000,
+            serial_protocol: "csv".into(),
+            serial_frame_tags: vec!["A0".into(), "A1".into()],
+            serial_channel_tags: vec!["A0".into(), "A1".into()],
+            serial_sequence_tag: None,
+            serial_startup_delay_ms: 2000,
         }
     }
 }
@@ -360,8 +412,11 @@ impl Config {
         let s = &self.source;
         let p = &self.processing;
         let fs = s.sample_rate_hz;
-        if !["synthetic", "replay", "serial-test", "bitronics"].contains(&s.mode.as_str()) {
-            return Err("source.mode: synthetic | replay | serial-test | bitronics".into());
+        if !["synthetic", "replay", "serial", "serial-test", "bitronics"].contains(&s.mode.as_str())
+        {
+            return Err(
+                "source.mode: synthetic | replay | serial (serial-test is a legacy alias)".into(),
+            );
         }
         if s.anomalies.skip_every == 1 {
             return Err("skip_every: 0 (выключено) или >= 2".into());
@@ -486,13 +541,27 @@ impl Config {
         if s.mode == "synthetic" && s.mains > 0. && nyquist <= 50. {
             return Err("Помеха 50 Гц требует sample_rate_hz > 100".into());
         }
-        if s.mode == "serial-test"
+        if matches!(s.mode.as_str(), "serial" | "serial-test")
             && (s.ports.is_empty()
                 || s.ports.len() > s.channels
                 || s.baud_rate == 0
                 || !(100..=60000).contains(&s.serial_idle_timeout_ms))
         {
-            return Err("serial-test: укажите 1 порт (1/2 канала) или 2 порта (по каналу), baud_rate > 0, timeout 100..60000 мс".into());
+            return Err("serial: укажите 1 порт (1/2 канала) или 2 порта (по каналу), baud_rate > 0, timeout 100..60000 мс".into());
+        }
+        if matches!(s.mode.as_str(), "serial" | "serial-test") {
+            if !matches!(s.serial_protocol.as_str(), "csv" | "tagged-u8") {
+                return Err("source.serial_protocol: csv | tagged-u8".into());
+            }
+            if s.serial_protocol == "tagged-u8" {
+                s.validate_serial_tags()?;
+                if s.ports.len() != 1 {
+                    return Err("tagged-u8 requires exactly one port".into());
+                }
+            }
+            if s.serial_startup_delay_ms > 60000 {
+                return Err("serial_startup_delay_ms: 0..60000".into());
+            }
         }
         if s.ports.len() == 2 && s.ports[0] == s.ports[1] {
             return Err("Порты должны различаться".into());

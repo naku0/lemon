@@ -1,5 +1,6 @@
 //! Lossless wide CSV, streamed replay, and session metadata. Raw values are never filtered here.
 use core_types::*;
+mod dmov;
 pub mod external;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -32,9 +33,9 @@ impl Metadata {
         };
         Self { format_version: 1, started_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |v| v.as_millis()),
             application_version: env!("CARGO_PKG_VERSION").into(),
-            channel_ids: (0..config.source.channels).map(|i|format!("ch{}",i+1)).collect(), devices,
-            timestamp_basis: "source-relative ns; serial-test: host arrival estimate, not hardware synchronization".into(),
-            units: if synthetic { Some("arbitrary units".into()) } else { config.source.units.clone() },
+            channel_ids: (0..config.source.channels).map(|i| if matches!(config.source.mode.as_str(), "serial" | "serial-test") && config.source.serial_protocol == "tagged-u8" { config.source.serial_channel_tags.get(i).cloned().unwrap_or_else(|| format!("ch{}", i+1)) } else {format!("ch{}",i+1)}).collect(), devices,
+            timestamp_basis: if matches!(config.source.mode.as_str(), "serial" | "serial-test") { "reconstructed host-side ns = (decoded frame index + inferred missing frames) / nominal sample rate; optional modulo-256 counter configured in serial_sequence_tag (resets, reordering, losses of 256 frames ambiguous); without counter loss unknown; no device timestamps or checksum; sequential channel sampling offset unknown; synchronized_clock=false" } else { "source-relative ns" }.into(),
+            units: if synthetic { Some("arbitrary units".into()) } else { config.source.units.clone().or_else(|| (matches!(config.source.mode.as_str(), "serial" | "serial-test") && config.source.serial_protocol == "tagged-u8").then(|| "adc_counts_u8".into())) },
             synthetic_seed: synthetic.then_some(config.source.seed), config, provenance: None,
         }
     }

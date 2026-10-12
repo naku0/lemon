@@ -68,6 +68,7 @@ with tempfile.TemporaryDirectory(prefix='lemon-report-кириллица-') as t
         if raw: args.append('--include-raw')
         subprocess.run(args,check=True,capture_output=True)
         nb=json.loads((colab/'report-colab.ipynb').read_text())
+        assert nb['metadata']['kernelspec']['name'] == 'python3'
         code='\n'.join(''.join(c['source']) for c in nb['cells'] if c['cell_type']=='code')
         assert 'fft(' not in code.lower() and 'welch(' not in code.lower()
         assert 'INSTALL_MISSING_REPORT_PACKAGES = False' in code
@@ -117,6 +118,11 @@ with tempfile.TemporaryDirectory(prefix='lemon-report-кириллица-') as t
             if cell.cell_type=='code':
                 assert cell.execution_count is not None
                 assert all(o.output_type!='error' for o in cell.outputs)
-        assert len(list((executed/'figures').glob('*.png')))==6
+        figures={path.name for path in (executed/'figures').glob('*.png')}
+        assert {'raw-overview.png','filtered-overview.png','raw-filtered-comparison.png','spectrum.png','quality-distribution.png'} <= figures
+        assert len([name for name in figures if name.startswith('band-power-')]) == 6
+        namespace_code='\n'.join(''.join(cell.source) for cell in nb.cells if cell.cell_type=='code')
+        for name in ['raw_df','filtered_df','signal_df','psd_df','band_power_df','quality_events_df','select_interval','plot_signal']:
+            assert name in namespace_code
         assert fingerprints(analysis)==before and source.read_bytes()==original
-        print('PASS executed notebook: six PNG, every cell executed, no error, input unchanged')
+        print('PASS executed research notebook: split figures, every cell executed, no error, input unchanged')

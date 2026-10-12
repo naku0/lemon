@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+pub const KERNEL_NAME: &str = "lemon-report";
+pub const KERNEL_DISPLAY_NAME: &str = "LEMON Reports";
+
 pub fn directory() -> Result<PathBuf, ReportError> {
     let dirs =
         directories::BaseDirs::new().ok_or("report/environment: home directory unavailable")?;
@@ -103,7 +106,10 @@ pub fn doctor() -> Result<Value, ReportError> {
         Ok(version) => json!({"found":true,"command":candidate,"version":version.trim()}),
         Err(e) => json!({"found":false,"command":candidate,"problem":e}),
     };
-    let result = probe(&python);
+    let result = probe(&python).and_then(|mut info| {
+        info["kernel"] = kernel_info(&python, &run)?;
+        Ok(info)
+    });
     Ok(match result {
         Ok(info) => {
             json!({"system_python":system_info,"ready":true,"venv":dir,"python":python,"details":info,"test_notebook":"passed"})
@@ -140,6 +146,61 @@ print('ok')"#;
     )?;
     Ok(info)
 }
+fn register_kernel(
+    python: &Path,
+    runner: &impl Fn(&mut Command, Duration) -> Result<String, String>,
+) -> Result<(), ReportError> {
+    runner(
+        Command::new(python).args([
+            "-m",
+            "ipykernel",
+            "install",
+            "--user",
+            "--name",
+            KERNEL_NAME,
+            "--display-name",
+            KERNEL_DISPLAY_NAME,
+        ]),
+        Duration::from_secs(60),
+    )?;
+    Ok(())
+}
+fn kernel_info(
+    python: &Path,
+    runner: &impl Fn(&mut Command, Duration) -> Result<String, String>,
+) -> Result<Value, ReportError> {
+    let code = format!(
+        r#"import json
+from jupyter_client.kernelspec import KernelSpecManager
+spec = KernelSpecManager().get_kernel_spec({name:?})
+print(json.dumps({{"name": {name:?}, "display_name": spec.display_name, "argv": spec.argv}}))"#,
+        name = KERNEL_NAME
+    );
+    let output = runner(
+        Command::new(python).args(["-c", &code]),
+        Duration::from_secs(30),
+    )?;
+    let info: Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
+    let registered = info["argv"]
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .ok_or("report/environment: LEMON kernel has no Python executable")?;
+    let expected = python
+        .canonicalize()
+        .unwrap_or_else(|_| python.to_path_buf());
+    let registered = Path::new(registered)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(registered));
+    if registered != expected {
+        return Err(format!(
+            "report/environment: kernel {KERNEL_NAME} uses {}, expected {}; run lemon report setup",
+            registered.display(),
+            expected.display()
+        ));
+    }
+    Ok(info)
+}
 fn checked_target(dir: &Path) -> Result<(), ReportError> {
     if dir.file_name().and_then(|s| s.to_str()) != Some("report-python") {
         return Err("report/setup: unexpected environment path".into());
@@ -165,8 +226,12 @@ fn setup_at(
 ) -> Result<Value, ReportError> {
     checked_target(dir)?;
     if dir.exists() && !recreate {
-        return probe_with(&interpreter(dir), runner)
-            .map_err(|e| format!("{e}\nRun lemon report setup --recreate"));
+        let python = interpreter(dir);
+        let mut info = probe_with(&python, runner)
+            .map_err(|e| format!("{e}\nRun lemon report setup --recreate"))?;
+        register_kernel(&python, runner)?;
+        info["kernel"] = kernel_info(&python, runner)?;
+        return Ok(info);
     }
     let python = if let Some(selected) = selected {
         version(selected, runner)?;
@@ -235,7 +300,9 @@ fn setup_at(
             .arg(&requirements),
         Duration::from_secs(900),
     )?;
-    let info = probe_with(&python, runner)?;
+    register_kernel(&python, runner)?;
+    let mut info = probe_with(&python, runner)?;
+    info["kernel"] = kernel_info(&python, runner)?;
     fs::write(
         dir.join("lemon-environment.json"),
         serde_json::to_vec_pretty(&json!({"owner":"LEMON","status":"ready","details":info}))
@@ -266,6 +333,7 @@ mod tests {
         let dir = root.join("report-python");
         let calls = RefCell::new(Vec::new());
         let fake = |command: &mut Command, _: Duration| {
+            let program = command.get_program().to_string_lossy().into_owned();
             let args: Vec<_> = command
                 .get_args()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -278,6 +346,13 @@ mod tests {
             }
             if args.iter().any(|a| a.contains("dependency_versions")) {
                 Ok("{\"python_version\":\"3.12\",\"dependency_versions\":{}}".into())
+            } else if args.iter().any(|a| a.contains("KernelSpecManager")) {
+                Ok(serde_json::to_string(&json!({
+                    "name": KERNEL_NAME,
+                    "display_name": KERNEL_DISPLAY_NAME,
+                    "argv": [program, "-m", "ipykernel_launcher"]
+                }))
+                .expect("kernel json"))
             } else {
                 Ok("ok".into())
             }
@@ -291,6 +366,10 @@ mod tests {
             .borrow()
             .iter()
             .any(|(_, a)| a.iter().any(|a| a == "pip")));
+        assert!(calls
+            .borrow()
+            .iter()
+            .any(|(_, args)| { args.windows(2).any(|pair| pair == ["--name", KERNEL_NAME]) }));
         calls.borrow_mut().clear();
         probe_with(&interpreter(&dir), &fake).expect("doctor");
         assert!(!calls
@@ -317,6 +396,21 @@ mod tests {
         .is_err());
         assert!(!absent.exists());
         fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn doctor_rejects_kernel_for_another_python() {
+        let error = kernel_info(Path::new("/expected/lemon/python"), &|_, _| {
+            Ok(json!({
+                "name": KERNEL_NAME,
+                "display_name": KERNEL_DISPLAY_NAME,
+                "argv": ["/usr/local/bin/python3", "-m", "ipykernel_launcher"]
+            })
+            .to_string())
+        })
+        .expect_err("wrong kernel interpreter");
+        assert!(error.contains("kernel lemon-report uses"));
+        assert!(error.contains("expected /expected/lemon/python"));
+        assert!(error.contains("run lemon report setup"));
     }
     #[cfg(unix)]
     #[test]

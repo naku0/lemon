@@ -54,6 +54,142 @@ fn blocks(p: &Path) -> Vec<RawSignalBlock> {
     v
 }
 
+// Construct the verified binary profile, never use participant recordings as fixtures.
+fn dmov_packet(tick: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = ((5 + payload.len()) as u32).to_be_bytes().to_vec();
+    bytes.push(b'T');
+    bytes.extend(tick.to_le_bytes());
+    bytes.extend(payload);
+    bytes
+}
+
+#[test]
+fn dmov_recovers_split_fields_and_validates_dat_without_scaling_raw() {
+    let t = Temp::new();
+    let input = t.0.join("запись.dmov");
+    let mut bytes = dmov_packet(12207, b"A0\x41A2\xffA");
+    bytes.extend(dmov_packet(12707, b"0\x30A2\x31A7\x00"));
+    fs::write(&input, &bytes).expect("fixture");
+    let row = |tick: u32, value: u8| {
+        format!(
+            "{:.8} {:.8}\n",
+            (tick as f64 * 8192. / 1e9) as f32,
+            (value as f64 / 255. * 5.) as f32
+        )
+    };
+    t.file("запись_EMG.dat", &row(12207, 65));
+    t.file("запись_EEG.dat", &(row(12207, 255) + &row(12707, 49)));
+    let out = t.import(&input, &explicit());
+    let data = blocks(&out);
+    assert!(data.iter().all(|b| !b.synchronized_clock));
+    for (ch, expected) in [[65., 48.], [255., 49.]].iter().enumerate() {
+        let samples: Vec<_> = data.iter().flat_map(|b| &b.channels[ch].samples).collect();
+        assert_eq!(
+            samples.iter().map(|s| s.value).collect::<Vec<_>>(),
+            *expected
+        );
+        assert_eq!(
+            samples.iter().map(|s| s.timestamp_ns).collect::<Vec<_>>(),
+            [0, 4_000_000]
+        );
+        assert_eq!(
+            samples.iter().map(|s| s.sequence).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+    let meta = read_metadata(&out).expect("metadata");
+    assert_eq!(meta.channel_ids, ["A0", "A2"]);
+    assert_eq!(meta.units.as_deref(), Some("adc_counts_u8"));
+    let provenance = serde_json::to_value(meta.provenance).expect("provenance");
+    assert_eq!(
+        provenance["source_channel_map"]["A0"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        provenance["validation_against_dat"]["A0"]["matched_rows"],
+        1
+    );
+    assert_eq!(
+        provenance["validation_against_dat"]["A0"]["cross_record_fields_recovered"],
+        1
+    );
+    let events = fs::read_to_string(out.join("events.csv")).expect("events");
+    assert!(events.contains("12207") && events.contains("12707"));
+    assert_eq!(fs::read(input).expect("input preserved"), bytes);
+}
+
+#[test]
+fn dmov_missing_channel_is_empty_and_time_gap_is_an_event() {
+    for tag in [b'0', b'2'] {
+        let t = Temp::new();
+        let input = t.0.join("missing.dmov");
+        let mut bytes = dmov_packet(100, &[b'A', tag, 1]);
+        bytes.extend(dmov_packet(110, &[b'A', tag, 2]));
+        bytes.extend(dmov_packet(20000, &[b'A', tag, 3]));
+        fs::write(&input, bytes).expect("fixture");
+        let out = t.import(&input, &explicit());
+        let data = blocks(&out);
+        let selected = usize::from(tag == b'2');
+        assert!(data
+            .iter()
+            .all(|b| b.channels[1 - selected].samples.is_empty()));
+        let samples: Vec<_> = data
+            .iter()
+            .flat_map(|b| &b.channels[selected].samples)
+            .collect();
+        assert_eq!(samples.len(), 3);
+        assert!(samples
+            .windows(2)
+            .all(|s| s[0].timestamp_ns < s[1].timestamp_ns));
+        assert!(samples[2]
+            .flags
+            .contains(&core_types::SignalFlag::LostSample));
+        assert!(fs::read_to_string(out.join("events.csv"))
+            .expect("events")
+            .contains("ImportGap"));
+    }
+}
+
+#[test]
+fn dmov_rejects_corruption_with_offset_before_creating_output() {
+    let mut truncated = dmov_packet(100, b"A0\x01A2\x02");
+    truncated.pop();
+    let mut backwards = dmov_packet(100, b"A0\x01");
+    backwards.extend(dmov_packet(99, b"A2\x02"));
+    let cases = vec![
+        vec![],
+        vec![1, 2],
+        vec![0, 0, 0, 5, b'T'],
+        vec![0, 0, 16, 1, b'T'],
+        truncated,
+        backwards,
+        dmov_packet(100, b"A0"),
+        dmov_packet(100, b"B0\x01"),
+        vec![255; 5000],
+    ];
+    for bytes in cases {
+        let t = Temp::new();
+        let input = t.0.join("broken.dmov");
+        fs::write(&input, bytes).expect("fixture");
+        let out = t.0.join("out");
+        let err = external::import(&input, Some(&out), &t.0, &explicit(), &Config::default())
+            .expect_err("reject");
+        assert!(err.contains("byte") && err.contains("DMOV"), "{err}");
+        assert!(!out.exists());
+    }
+}
+
+#[test]
+fn dmov_mismatched_companion_is_not_silently_accepted() {
+    let t = Temp::new();
+    let input = t.0.join("x.dmov");
+    fs::write(&input, dmov_packet(100, b"A0\x01A2\x02")).expect("fixture");
+    t.file("x_EMG.dat", "0 99\n");
+    let err = external::import(&input, None, &t.0, &explicit(), &Config::default())
+        .expect_err("mismatch");
+    assert!(err.contains("validation") && err.contains("line"), "{err}");
+}
+
 #[test]
 fn dat_whitespace_repeated_times_preserves_values_on_strict_grid() {
     let t = Temp::new();
@@ -110,7 +246,7 @@ fn differing_duplicate_and_missing_dmov_dat_require_explicit_action() {
     let e = external::prepare(&p, &explicit(), &Config::default())
         .err()
         .expect("no DAT");
-    assert!(e.contains("DAT-файлы не найдены"));
+    assert!(e.contains("DMOV") && e.contains("byte 0"), "{e}");
 }
 #[test]
 fn damaged_and_backward_dat_report_line_and_do_not_create_output() {

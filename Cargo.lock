@@ -16,7 +16,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "analysis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core",
  "csv",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "analysis",
  "clap",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "processing"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core",
  "rustfft",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "report"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "analysis",
  "base64",
@@ -1030,7 +1030,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "source"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core",
  "serialport",
@@ -1045,7 +1045,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core",
  "csv",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core",
  "crossterm",

@@ -256,6 +256,10 @@ pub const COLORS: [&str; 9] = [
     "gray", "white", "black", "red", "green", "yellow", "blue", "magenta", "cyan",
 ];
 pub fn parse_color(s: &str) -> Result<Color> {
+    if s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit()) {
+        let rgb = u32::from_str_radix(&s[1..], 16).map_err(|e| e.to_string())?;
+        return Ok(Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8));
+    }
     match s {
         "gray" => Ok(Color::Gray),
         "white" => Ok(Color::White),
@@ -302,7 +306,27 @@ impl Appearance {
             error: Color::Red,
         };
         match self.theme {
-            Theme::Dark => {}
+            Theme::Dark => {
+                // xterm-256 is supported by macOS Terminal and common SSH/PTY
+                // sessions.  Avoid unconditional 24-bit escape sequences here:
+                // terminals which only advertise 256 colors can render those
+                // sequences as broken backgrounds or unreadable foregrounds.
+                p.background = Color::Indexed(234); // #1c1c1c, not absolute black
+                p.text = Color::Indexed(255); // #eeeeee
+                p.muted = Color::Indexed(250); // #bcbcbc
+                p.accent = Color::Indexed(220); // bright yellow
+                p.raw = Color::Indexed(117); // light blue
+                p.filtered = Color::Indexed(48); // bright cyan-green
+                p.channels = [Color::Indexed(75), Color::Indexed(215)]; // blue / orange
+                p.bands = [
+                    Color::Indexed(141), // violet: Theta
+                    Color::Indexed(48),  // green: Alpha/Mu
+                    Color::Indexed(220), // amber: Beta
+                ];
+                p.good = Color::Indexed(48);
+                p.warning = Color::Indexed(220);
+                p.error = Color::Indexed(203); // coral/red
+            }
             Theme::Light => {
                 p.background = Color::White;
                 p.text = Color::Black;
@@ -359,11 +383,64 @@ impl Appearance {
     }
 }
 fn color_name(c: Color) -> String {
+    match c {
+        Color::Rgb(r, g, b) => return format!("#{r:02x}{g:02x}{b:02x}"),
+        Color::Indexed(index) => {
+            let (r, g, b) = xterm_rgb(index);
+            return format!("#{r:02x}{g:02x}{b:02x}");
+        }
+        _ => {}
+    }
     COLORS
         .iter()
         .find(|s| parse_color(s).ok() == Some(c))
         .unwrap_or(&"gray")
         .to_string()
+}
+
+pub(crate) fn xterm_rgb(index: u8) -> (u8, u8, u8) {
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match index {
+        0..=15 => ANSI[index as usize],
+        16..=231 => {
+            let n = index - 16;
+            let level = |value: u8| if value == 0 { 0 } else { 55 + value * 40 };
+            (level(n / 36), level((n / 6) % 6), level(n % 6))
+        }
+        _ => {
+            let gray = 8 + (index - 232) * 10;
+            (gray, gray, gray)
+        }
+    }
+}
+
+pub(crate) fn nearest_xterm((r, g, b): (u8, u8, u8)) -> u8 {
+    (16u16..=255)
+        .min_by_key(|&index| {
+            let (cr, cg, cb) = xterm_rgb(index as u8);
+            let dr = r as i32 - cr as i32;
+            let dg = g as i32 - cg as i32;
+            let db = b as i32 - cb as i32;
+            dr * dr + dg * dg + db * db
+        })
+        .unwrap_or(255) as u8
 }
 
 #[cfg(test)]
@@ -382,6 +459,62 @@ mod tests {
         a.customize();
         a.raw = "red".into();
         assert_eq!(a.palette().raw, Color::Red);
+    }
+    #[test]
+    fn dark_colors_have_contrast_and_survive_customization() {
+        let mut a = Settings::default().appearance;
+        let p = a.palette();
+        let luminance = |color: Color| {
+            let (r, g, b) = match color {
+                Color::Rgb(r, g, b) => (r, g, b),
+                Color::Indexed(index) => xterm_rgb(index),
+                _ => panic!("RGB or indexed palette expected"),
+            };
+            let linear = |v: u8| {
+                let v = v as f64 / 255.;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        };
+        for color in [
+            p.text,
+            p.muted,
+            p.raw,
+            p.filtered,
+            p.accent,
+            p.error,
+            p.warning,
+            p.channels[0],
+            p.channels[1],
+            p.bands[0],
+            p.bands[1],
+            p.bands[2],
+        ] {
+            assert!((luminance(color) + 0.05) / (luminance(p.background) + 0.05) >= 4.5);
+        }
+        assert_ne!(p.raw, p.filtered);
+        assert_ne!(p.channels[0], p.channels[1]);
+        assert_ne!(p.bands[0], p.bands[1]);
+        assert_ne!(p.bands[1], p.bands[2]);
+        a.customize();
+        assert_eq!(a.palette().raw, Color::Rgb(135, 215, 255));
+        assert_eq!(a.palette().filtered, Color::Rgb(0, 255, 135));
+        assert_eq!(a.palette().bands[0], Color::Rgb(175, 135, 255));
+    }
+    #[test]
+    fn xterm_palette_conversion_covers_ansi_cube_and_gray() {
+        assert_eq!(xterm_rgb(0), (0, 0, 0));
+        assert_eq!(xterm_rgb(117), (135, 215, 255));
+        assert_eq!(xterm_rgb(234), (28, 28, 28));
+        assert_eq!(nearest_xterm(xterm_rgb(117)), 117);
+        assert_eq!(
+            parse_color(&color_name(Color::Indexed(215))),
+            Ok(Color::Rgb(255, 175, 95))
+        );
     }
     #[test]
     fn partial_settings_and_bad_colors() {

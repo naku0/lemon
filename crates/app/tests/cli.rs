@@ -293,7 +293,113 @@ fn two_live_ports_infer_two_channels() {
     let c = parse(&["lemon", "live", "--port", "a", "--port", "b"]);
     let r = resolve(&c, &Environment::default(), None, None).expect("ports");
     assert_eq!(r.experiment.source.channels, 2);
-    assert_eq!(r.experiment.source.mode, "serial-test");
+    assert_eq!(r.experiment.source.mode, "serial");
+}
+
+#[test]
+fn probe_port_is_not_legacy_and_a0_profile_resolves() {
+    use app::cli::legacy_hint;
+    let args: Vec<String> = [
+        "lemon",
+        "probe",
+        "--port",
+        "/dev/cu.usbmodem1401",
+        "--output",
+        "capture.bin",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert!(legacy_hint(&args).is_none());
+    assert!(legacy_hint(&["lemon", "--port", "old"].map(String::from)).is_some());
+    assert!(legacy_hint(&["lemon", "live", "--port", "ok"].map(String::from)).is_none());
+    // Keep the CLI regression independent of the user's editable hardware profile.
+    let profile: serde_json::Value =
+        serde_json::from_str(include_str!("../../../examples/serial-tagged-u8-a0.json"))
+            .expect("example");
+    let expected_channels = profile["source"]["channels"].as_u64().expect("channels") as usize;
+    let expected_tags: Vec<String> =
+        serde_json::from_value(profile["source"]["serial_channel_tags"].clone()).expect("tags");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/serial-tagged-u8-a0.json");
+    let c = parse(&[
+        "lemon",
+        "live",
+        "--config",
+        path.to_str().expect("path"),
+        "--port",
+        "/dev/cu.usbmodem1401",
+    ]);
+    let r = resolve(&c, &Environment::default(), None, None).expect("profile");
+    assert_eq!(r.experiment.source.channels, expected_channels);
+    assert_eq!(r.experiment.source.serial_channel_tags, expected_tags);
+    assert_eq!(
+        r.experiment.source.serial_sequence_tag.as_deref(),
+        Some("A9")
+    );
+    // Exercise the executable's legacy gate without touching hardware.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lemon"))
+        .args(args.iter().skip(1))
+        .arg("--help")
+        .output()
+        .expect("probe CLI");
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Используйте lemon live"));
+}
+
+#[test]
+fn serial_protocol_options_and_probe_help() {
+    let c = parse(&[
+        "lemon",
+        "live",
+        "--port",
+        "uno",
+        "--protocol",
+        "tagged-u8",
+        "--sample-rate",
+        "333.333",
+        "--channels",
+        "2",
+    ]);
+    let r = resolve(&c, &Environment::default(), None, None).expect("tagged");
+    assert_eq!(r.experiment.source.serial_protocol, "tagged-u8");
+    assert_eq!(r.experiment.source.sample_rate_hz, 333.333);
+    assert_eq!(r.experiment.source.units.as_deref(), Some("adc_counts_u8"));
+    let c = parse(&["lemon", "live", "--port", "uno", "--protocol", "tagged-u8"]);
+    assert!(resolve(&c, &Environment::default(), None, None)
+        .err()
+        .expect("rate")
+        .contains("sample-rate"));
+    let c = parse(&[
+        "lemon",
+        "live",
+        "--port",
+        "uno",
+        "--protocol",
+        "tagged-u8",
+        "--sample-rate",
+        "333.333",
+        "--channels",
+        "1",
+    ]);
+    assert!(resolve(&c, &Environment::default(), None, None).is_err());
+    let c = parse(&[
+        "lemon",
+        "probe",
+        "--port",
+        "uno",
+        "--duration",
+        "10",
+        "--output",
+        "capture.bin",
+    ]);
+    assert_eq!(c.duration, Some(10.));
+    for command in ["live", "probe", "ports"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_lemon"))
+            .args([command, "--help"])
+            .output()
+            .expect("help");
+        assert!(output.status.success());
+    }
 }
 
 #[test]
