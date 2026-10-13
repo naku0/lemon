@@ -4,7 +4,11 @@ mod plot;
 use lemon_plugin_sdk::{
     write_plugin_result, Artifact, ArtifactKind, Bundle, PluginResult, PluginStatus,
 };
-use rustfft::{num_complex::Complex, FftPlanner};
+use processing::windows::{
+    flags_from_codes, AnalysisSample, LegacySegments, SignalFlag, WindowCandidate, WindowGenerator,
+    WindowingConfig,
+};
+use processing::{integrate_band_power, one_sided_psd, WindowFunction};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -59,6 +63,8 @@ struct Sample {
     value: Option<f64>,
     quality: String,
     flags: String,
+    segment_id: u64,
+    sample_valid: bool,
 }
 #[derive(Debug, Clone)]
 struct Event {
@@ -69,10 +75,14 @@ struct Event {
 type SamplesByChannel = BTreeMap<String, Vec<Sample>>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowPower {
+    dsp_algorithm_version: u32,
+    psd_algorithm_version: u32,
+    window_function: String,
     bundle: String,
     condition: String,
     channel: String,
-    window_index: usize,
+    window_index: u64,
+    segment_id: Option<u64>,
     window_start_ns: u64,
     window_end_ns: u64,
     midpoint_seconds: f64,
@@ -83,16 +93,21 @@ struct WindowPower {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExcludedWindow {
+    dsp_algorithm_version: u32,
     bundle: String,
     condition: String,
     channel: String,
-    window_index: usize,
+    window_index: u64,
+    segment_id: Option<u64>,
     window_start_ns: u64,
     window_end_ns: u64,
     reason: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConditionResult {
+    dsp_algorithm_version: u32,
+    psd_algorithm_version: u32,
+    window_function: String,
     condition: String,
     channel: String,
     band: String,
@@ -111,6 +126,12 @@ struct Summary {
     plugin_id: &'static str,
     plugin_version: &'static str,
     input_bundle_versions: BTreeMap<String, String>,
+    dsp_algorithm_versions: BTreeMap<String, u32>,
+    psd_algorithm_versions: BTreeMap<String, u32>,
+    computed_psd_algorithm_version: u32,
+    windowing_algorithm_version: u32,
+    input_windowing_algorithm_versions: BTreeMap<String, u32>,
+    input_processing_configs: BTreeMap<String, serde_json::Value>,
     synchronization_status: BTreeMap<String, String>,
     sample_rate_hz: f64,
     sample_rates_hz: BTreeMap<String, f64>,
@@ -130,6 +151,8 @@ struct Summary {
     valid_windows: BTreeMap<String, usize>,
     excluded_windows: BTreeMap<String, usize>,
     exclusion_reasons: BTreeMap<String, usize>,
+    bundle_excluded_windows: BTreeMap<String, usize>,
+    bundle_exclusion_reasons: BTreeMap<String, BTreeMap<String, usize>>,
     warnings: Vec<String>,
     limitations: Vec<String>,
 }
@@ -192,6 +215,10 @@ pub fn run(args: Arguments) -> Result<(), String> {
     let mut powers = Vec::new();
     let mut excluded = Vec::new();
     let mut versions = BTreeMap::new();
+    let mut dsp_versions = BTreeMap::new();
+    let mut psd_versions = BTreeMap::new();
+    let mut bundle_excluded_windows = BTreeMap::new();
+    let mut bundle_exclusion_reasons = BTreeMap::new();
     let mut synchronization = BTreeMap::new();
     let mut sample_rates = BTreeMap::new();
     let mut sample_rate_sources = BTreeMap::new();
@@ -210,6 +237,25 @@ pub fn run(args: Arguments) -> Result<(), String> {
                 bundle.manifest().lemon_version
             ),
         );
+        dsp_versions.insert(label.clone(), bundle.manifest().dsp_algorithm_version);
+        psd_versions.insert(label.clone(), bundle.manifest().psd_algorithm_version);
+        let mut source_excluded = 0;
+        let mut source_reasons = BTreeMap::new();
+        if let Some(rows) = bundle.excluded_windows().map_err(|e| e.to_string())? {
+            for row in rows {
+                let row = row.map_err(|e| e.to_string())?;
+                for reason in row
+                    .reason_codes
+                    .split('|')
+                    .filter(|reason| !reason.is_empty())
+                {
+                    *source_reasons.entry(reason.to_owned()).or_insert(0) += 1;
+                }
+                source_excluded += 1;
+            }
+        }
+        bundle_excluded_windows.insert(label.clone(), source_excluded);
+        bundle_exclusion_reasons.insert(label.clone(), source_reasons);
         synchronization.insert(
             label.clone(),
             if bundle
@@ -226,16 +272,19 @@ pub fn run(args: Arguments) -> Result<(), String> {
         sample_rate_sources.insert(label.clone(), bundle.manifest().sample_rate_source.clone());
         window_sizes.insert(label.clone(), bundle_window_samples);
         hop_sizes.insert(label.clone(), bundle_hop_samples);
-        let sample_quality_reliable = !bundle
-            .manifest()
-            .analysis_warnings
-            .iter()
-            .any(|warning| warning.contains("one-sample blocks"));
+        let sample_quality_reliable = bundle.manifest().analysis_format_version < 2
+            && !bundle
+                .manifest()
+                .analysis_warnings
+                .iter()
+                .any(|warning| warning.contains("one-sample blocks"));
         if sample_quality_reliable {
             quality_assessment.insert(
                 label.clone(),
                 "sample quality labels and timestamped quality events applied".into(),
             );
+        } else if bundle.manifest().analysis_format_version >= 2 {
+            quality_assessment.insert(label.clone(), "v2 sample_valid, segment_id and artifact flags applied; display quality does not override eligibility".into());
         } else {
             quality_assessment.insert(
                 label.clone(),
@@ -262,13 +311,24 @@ pub fn run(args: Arguments) -> Result<(), String> {
                 bundle_window_samples,
                 bundle_hop_samples,
                 bundle_rate,
+                bundle.manifest().dsp_algorithm_version,
+                processing::PSD_ALGORITHM_VERSION,
                 sample_quality_reliable,
+                bundle.manifest().analysis_format_version < 2,
+                bundle.manifest().reject_low_quality_windows,
                 &mut powers,
                 &mut excluded,
-            );
+            )?;
         }
     }
-    let results = aggregate(&config, &powers, &excluded, &mut warnings);
+    let results = aggregate(
+        &config,
+        &powers,
+        &excluded,
+        inputs[0].1.manifest().dsp_algorithm_version,
+        processing::PSD_ALGORITHM_VERSION,
+        &mut warnings,
+    );
     write_powers(args.output.join("windowed-band-power.csv"), &powers)?;
     write_excluded(args.output.join("excluded-windows.csv"), &excluded)?;
     write_results(args.output.join("channel-condition-results.csv"), &results)?;
@@ -302,6 +362,12 @@ pub fn run(args: Arguments) -> Result<(), String> {
         plugin_id: PLUGIN_ID,
         plugin_version: PLUGIN_VERSION,
         input_bundle_versions: versions,
+        dsp_algorithm_versions: dsp_versions,
+        psd_algorithm_versions: psd_versions,
+        computed_psd_algorithm_version: processing::PSD_ALGORITHM_VERSION,
+        windowing_algorithm_version: processing::windows::WINDOWING_ALGORITHM_VERSION,
+        input_windowing_algorithm_versions: inputs.iter().map(|(label,bundle)| (label.clone(), bundle.manifest().windowing_algorithm_version)).collect(),
+        input_processing_configs: inputs.iter().map(|(label, bundle)| (label.clone(), bundle.manifest().processing_config.clone())).collect(),
         synchronization_status: synchronization,
         sample_rate_hz: fs_hz,
         sample_rates_hz: sample_rates,
@@ -315,7 +381,7 @@ pub fn run(args: Arguments) -> Result<(), String> {
         hop_samples,
         window_samples_by_input: window_sizes,
         hop_samples_by_input: hop_sizes,
-        window_function: "Hann",
+        window_function: "hann_symmetric",
         psd_method:
             "one-sided periodogram; sum of PSD bins multiplied by frequency-bin width",
         bands_hz: BTreeMap::from([
@@ -325,6 +391,8 @@ pub fn run(args: Arguments) -> Result<(), String> {
         valid_windows: valid_counts,
         excluded_windows: excluded_counts,
         exclusion_reasons: reasons,
+        bundle_excluded_windows,
+        bundle_exclusion_reasons,
         warnings: warnings.clone(),
         limitations: vec![
             "Separate recordings without baseline_start, cue, task_start and task_end markers are compared descriptively; this is not event-locked MuERD, ERD or ERS.".into(),
@@ -462,7 +530,7 @@ fn validate_bundles(config: &Config, inputs: &[(String, Bundle)]) -> Result<Vec<
         }
         let rate_delta = (bundle.sample_rate_hz() - baseline.sample_rate_hz()).abs();
         let relative_rate_delta = rate_delta / baseline.sample_rate_hz();
-        if relative_rate_delta > 0.005 {
+        if relative_rate_delta > 1e-9 {
             return Err(format!("condition {label:?} has incompatible sample rate"));
         }
         if rate_delta > 1e-9 {
@@ -482,11 +550,58 @@ fn validate_bundles(config: &Config, inputs: &[(String, Bundle)]) -> Result<Vec<
         if bundle.units() != baseline.units() {
             return Err(format!("condition {label:?} has incompatible units"));
         }
-        if bundle.manifest().processing_config != baseline.manifest().processing_config {
+        let required_processing_fields = [
+            "high_pass_hz",
+            "low_pass_hz",
+            "notch",
+            "notch_hz",
+            "notch_q",
+            "window_samples",
+            "hop_samples",
+            "window_function",
+            "artifact_policy",
+            "filter_warmup_seconds",
+            "reject_low_quality_windows",
+            "expected_abs_max",
+            "outlier_step",
+            "flat_stddev",
+            "mains_ratio_limit",
+        ];
+        for field in required_processing_fields {
+            if bundle.manifest().processing_config.get(field)
+                != baseline.manifest().processing_config.get(field)
+            {
+                return Err(format!(
+                    "condition {label:?} has incompatible processing_config.{field}"
+                ));
+            }
+        }
+        if bundle.manifest().dsp_algorithm_version != baseline.manifest().dsp_algorithm_version
+            || bundle.manifest().windowing_algorithm_version
+                != baseline.manifest().windowing_algorithm_version
+            || bundle.manifest().psd_algorithm_version != baseline.manifest().psd_algorithm_version
+            || bundle.manifest().processing_mode != baseline.manifest().processing_mode
+            || bundle.manifest().window_function != baseline.manifest().window_function
+            || bundle.manifest().spectral_config != baseline.manifest().spectral_config
+            || bundle.manifest().configured_bands != baseline.manifest().configured_bands
+        {
             return Err(format!(
-                "condition {label:?} has incompatible processing_config"
+                "condition {label:?} has incompatible DSP/PSD provenance"
             ));
         }
+        if bundle.manifest().processing_config != baseline.manifest().processing_config {
+            warnings.push(format!(
+                "Condition {label:?} differs in secondary processing configuration fields; required DSP compatibility fields match."
+            ));
+        }
+    }
+    if baseline.manifest().windowing_algorithm_version == 0 {
+        warnings.push("Input bundles predate the shared windowing contract; plugin candidates use windowing_algorithm_version=1.".into());
+    }
+    if baseline.manifest().dsp_algorithm_version < 2 {
+        warnings.push(
+            "Input bundles use legacy DSP algorithm version 1; artifact-free spectral eligibility cannot be established as strongly as for AnalysisBundle v2.".into(),
+        );
     }
     Ok(warnings)
 }
@@ -506,16 +621,18 @@ fn load_bundle(
                 value: row.filtered,
                 quality: row.quality,
                 flags: row.flags,
+                segment_id: row.segment_id,
+                sample_valid: row.sample_valid && !row.filter_warmup && !row.artifact_rejected,
             });
         }
-    }
-    for rows in samples.values_mut() {
-        rows.sort_by_key(|s| (s.timestamp_ns, s.sequence));
     }
     let mut events = Vec::new();
     for row in bundle.quality_events().map_err(|e| e.to_string())? {
         let row = row.map_err(|e| e.to_string())?;
-        if severe_event(&row.kind, &row.severity) {
+        if severe_event(&row.kind, &row.severity)
+            && (bundle.manifest().reject_low_quality_windows
+                || !row.kind.to_ascii_lowercase().contains("lowquality"))
+        {
             events.push(Event {
                 timestamp_ns: row.timestamp_ns,
                 channel: row.channel.filter(|c| !c.is_empty()),
@@ -535,7 +652,6 @@ fn severe_event(kind: &str, severity: &str) -> bool {
             "outlier",
             "saturation",
             "lowquality",
-            "insufficientdata",
             "gap",
         ]
         .iter()
@@ -553,138 +669,125 @@ fn analyze_channel(
     window: usize,
     hop: usize,
     fs_hz: f64,
+    dsp_algorithm_version: u32,
+    psd_algorithm_version: u32,
     sample_quality_reliable: bool,
+    legacy: bool,
+    reject_low_quality: bool,
     powers: &mut Vec<WindowPower>,
     excluded: &mut Vec<ExcludedWindow>,
-) {
-    if samples.is_empty() {
-        return;
-    }
-    let expected_ns = 1e9 / fs_hz;
-    for (index, start) in (0..samples.len()).step_by(hop).enumerate() {
-        if start + window > samples.len() {
-            break;
-        }
-        let slice = &samples[start..start + window];
-        let from = slice[0].timestamp_ns;
-        let to = slice[window - 1].timestamp_ns;
-        let mut reasons = BTreeSet::new();
-        if slice.iter().any(|s| s.value.is_none()) {
-            reasons.insert("missing filtered sample".to_string());
-        }
-        if sample_quality_reliable
-            && slice
-                .iter()
-                .any(|s| !matches!(s.quality.as_str(), "Good" | "Acceptable" | "Fair"))
-        {
-            reasons.insert("quality label below acceptable or unknown".to_string());
-        }
-        let relevant_flags: BTreeSet<_> = slice
-            .iter()
-            .flat_map(|sample| sample.flags.split('|'))
-            .filter(|flag| {
-                matches!(
-                    *flag,
-                    "LostSample"
-                        | "InvalidPacket"
-                        | "Disconnected"
-                        | "Outlier"
-                        | "Saturation"
-                        | "LowQuality"
-                        | "InsufficientData"
-                )
-            })
-            .collect();
-        if !relevant_flags.is_empty() {
-            reasons.insert(format!(
-                "signal flags: {}",
-                relevant_flags.into_iter().collect::<Vec<_>>().join("|")
-            ));
-        }
-        if slice
-            .windows(2)
-            .any(|p| p[1].sequence != p[0].sequence.saturating_add(1))
-        {
-            reasons.insert("sequence discontinuity".to_string());
-        }
-        if slice.windows(2).any(|p| {
-            ((p[1].timestamp_ns.saturating_sub(p[0].timestamp_ns) as f64) - expected_ns).abs()
-                > expected_ns * 0.51
-        }) {
-            reasons.insert("timestamp discontinuity".to_string());
-        }
-        for event in events.iter().filter(|e| {
-            e.timestamp_ns >= from
-                && e.timestamp_ns <= to
-                && e.channel.as_deref().is_none_or(|c| c == channel)
-        }) {
-            reasons.insert(event.reason.clone());
-        }
-        if reasons.is_empty() {
-            let values: Vec<f64> = slice.iter().filter_map(|s| s.value).collect();
-            let bins = psd(&values, fs_hz);
-            for (band, range) in [("Mu", config.bands.mu_hz), ("Beta", config.bands.beta_hz)] {
-                powers.push(WindowPower {
-                    bundle: bundle_name.to_string(),
+) -> Result<(), String> {
+    let mut window_config = WindowingConfig::new(window, hop, fs_hz);
+    window_config.reject_low_quality = reject_low_quality;
+    let mut segments = LegacySegments::new(window_config.clone())?;
+    let mut generator = WindowGenerator::new(window_config)?;
+    let mut consume = |candidate| -> Result<(), String> {
+        match candidate {
+            WindowCandidate::Rejected {
+                index,
+                segment_id,
+                start_timestamp_ns,
+                end_timestamp_ns,
+                reasons,
+                ..
+            } => {
+                excluded.push(ExcludedWindow {
+                    dsp_algorithm_version,
+                    bundle: bundle_name.into(),
                     condition: label.into(),
                     channel: channel.into(),
                     window_index: index,
-                    window_start_ns: from,
-                    window_end_ns: to,
-                    midpoint_seconds: (from as f64 + to as f64) / 2e9,
-                    band: band.into(),
-                    low_hz: range[0],
-                    high_hz: range[1],
-                    power: band_power(&bins, fs_hz, values.len(), range),
+                    segment_id,
+                    window_start_ns: start_timestamp_ns,
+                    window_end_ns: end_timestamp_ns,
+                    reason: reasons
+                        .iter()
+                        .map(|reason| reason.code())
+                        .collect::<Vec<_>>()
+                        .join("|"),
                 });
             }
+            WindowCandidate::Accepted {
+                index,
+                segment_id,
+                start_timestamp_ns,
+                end_timestamp_ns,
+                samples,
+            } => {
+                let values = samples
+                    .iter()
+                    .map(|sample| sample.value.ok_or("plugin: accepted value missing"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let psd = one_sided_psd(&values, fs_hz, WindowFunction::HannSymmetric)?;
+                for (band, range) in [("Mu", config.bands.mu_hz), ("Beta", config.bands.beta_hz)] {
+                    powers.push(WindowPower {
+                        dsp_algorithm_version,
+                        psd_algorithm_version,
+                        window_function: "hann_symmetric".into(),
+                        bundle: bundle_name.into(),
+                        condition: label.into(),
+                        channel: channel.into(),
+                        window_index: index,
+                        segment_id: Some(segment_id),
+                        window_start_ns: start_timestamp_ns,
+                        window_end_ns: end_timestamp_ns,
+                        midpoint_seconds: (start_timestamp_ns as f64 + end_timestamp_ns as f64)
+                            / 2e9,
+                        band: band.into(),
+                        low_hz: range[0],
+                        high_hz: range[1],
+                        power: integrate_band_power(&psd, range[0], range[1])?,
+                    });
+                }
+            }
+        }
+        Ok(())
+    };
+    for sample in samples {
+        let mut flags = flags_from_codes(&sample.flags);
+        // v2 per-sample metadata is authoritative. Legacy event records supply
+        // conservative additional flags, not a second window-validation pass.
+        if legacy {
+            if sample_quality_reliable
+                && !matches!(sample.quality.as_str(), "Good" | "Acceptable" | "Fair")
+            {
+                flags.push(SignalFlag::LowQuality);
+            }
+            for event in events.iter().filter(|event| {
+                event.timestamp_ns == sample.timestamp_ns
+                    && event.channel.as_deref().is_none_or(|id| id == channel)
+            }) {
+                let code = event.reason.trim_start_matches("quality event: ");
+                flags.extend(flags_from_codes(code));
+            }
+        }
+        let segment_id = if legacy {
+            segments.segment(sample.sequence, sample.timestamp_ns)
         } else {
-            excluded.push(ExcludedWindow {
-                bundle: bundle_name.to_string(),
-                condition: label.into(),
-                channel: channel.into(),
-                window_index: index,
-                window_start_ns: from,
-                window_end_ns: to,
-                reason: reasons.into_iter().collect::<Vec<_>>().join("; "),
-            });
+            sample.segment_id
+        };
+        for candidate in generator.push(AnalysisSample {
+            sequence: sample.sequence,
+            timestamp_ns: sample.timestamp_ns,
+            segment_id,
+            value: sample.value,
+            eligible: sample.sample_valid,
+            flags,
+        }) {
+            consume(candidate)?;
         }
     }
-}
-fn psd(values: &[f64], fs_hz: f64) -> Vec<f64> {
-    let n = values.len();
-    let hann: Vec<f64> = (0..n)
-        .map(|i| 0.5 - 0.5 * (2. * std::f64::consts::PI * i as f64 / n as f64).cos())
-        .collect();
-    let mean = values.iter().sum::<f64>() / n as f64;
-    let mut buffer: Vec<Complex<f64>> = values
-        .iter()
-        .zip(&hann)
-        .map(|(v, w)| Complex::new((v - mean) * w, 0.))
-        .collect();
-    FftPlanner::new().plan_fft_forward(n).process(&mut buffer);
-    let scale = fs_hz * hann.iter().map(|w| w * w).sum::<f64>();
-    buffer[..=n / 2]
-        .iter()
-        .enumerate()
-        .map(|(i, v)| v.norm_sqr() / scale * if i > 0 && i < n / 2 { 2. } else { 1. })
-        .collect()
-}
-fn band_power(psd: &[f64], fs_hz: f64, n: usize, range: [f64; 2]) -> f64 {
-    let df = fs_hz / n as f64;
-    psd.iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            let f = *i as f64 * df;
-            f >= range[0] && f < range[1]
-        })
-        .map(|(_, v)| v * df)
-        .sum()
+    if let Some(candidate) = generator.finish() {
+        consume(candidate)?;
+    }
+    Ok(())
 }
 fn aggregate(
     config: &Config,
     powers: &[WindowPower],
     excluded: &[ExcludedWindow],
+    dsp_algorithm_version: u32,
+    psd_algorithm_version: u32,
     warnings: &mut Vec<String>,
 ) -> Vec<ConditionResult> {
     let mut grouped: BTreeMap<(String, String, String), Vec<f64>> = BTreeMap::new();
@@ -730,6 +833,9 @@ fn aggregate(
                     warnings.push(format!("Cannot calculate change for condition {condition:?}, channel {channel:?}, band {band}: baseline or condition median is unavailable or baseline is near zero."));
                 }
                 out.push(ConditionResult {
+                    dsp_algorithm_version,
+                    psd_algorithm_version,
+                    window_function: "hann_symmetric".into(),
                     condition: condition.clone(),
                     channel: channel.clone(),
                     band: band.into(),
@@ -781,10 +887,14 @@ fn write_powers(path: PathBuf, rows: &[WindowPower]) -> Result<(), String> {
     let mut writer = writer(
         path,
         &[
+            "dsp_algorithm_version",
+            "psd_algorithm_version",
+            "window_function",
             "bundle",
             "condition",
             "channel",
             "window_index",
+            "segment_id",
             "window_start_ns",
             "window_end_ns",
             "midpoint_seconds",
@@ -803,10 +913,12 @@ fn write_excluded(path: PathBuf, rows: &[ExcludedWindow]) -> Result<(), String> 
     let mut writer = writer(
         path,
         &[
+            "dsp_algorithm_version",
             "bundle",
             "condition",
             "channel",
             "window_index",
+            "segment_id",
             "window_start_ns",
             "window_end_ns",
             "reason",
@@ -821,6 +933,9 @@ fn write_results(path: PathBuf, rows: &[ConditionResult]) -> Result<(), String> 
     let mut writer = writer(
         path,
         &[
+            "dsp_algorithm_version",
+            "psd_algorithm_version",
+            "window_function",
             "condition",
             "channel",
             "band",
@@ -869,7 +984,7 @@ mod tests {
         let dir = root.join(name);
         fs::create_dir(&dir).expect("bundle");
         let channels = ["A0", "A2"];
-        fs::write(dir.join("manifest.json"),serde_json::to_vec(&serde_json::json!({"analysis_format_version":1,"lemon_version":"0.2.0","created_at":"0","source":name,"source_format":"synthetic","source_path":name,"channels":channels,"units":"adc_counts_u8","sample_rate_hz":rate,"sample_rate_source":"confirmed","duration_seconds":seconds,"processing_config":{"filter":"same"},"spectral_config":{},"configured_bands":[]})).expect("json")).expect("manifest");
+        fs::write(dir.join("manifest.json"),serde_json::to_vec(&serde_json::json!({"analysis_format_version":2,"dsp_algorithm_version":3,"windowing_algorithm_version":1,"psd_algorithm_version":2,"processing_mode":"causal_live_compatible","window_function":"hann_symmetric","filter_warmup_seconds":2.0,"reject_low_quality_windows":true,"lemon_version":"0.2.0","created_at":"0","source":name,"source_format":"synthetic","source_path":name,"channels":channels,"units":"adc_counts_u8","sample_rate_hz":rate,"sample_rate_source":"confirmed","duration_seconds":seconds,"processing_config":{"filter":"same"},"spectral_config":{"window_samples":200,"hop_samples":50,"window":"hann_symmetric"},"configured_bands":[]})).expect("json")).expect("manifest");
         fs::write(dir.join("summary.json"),serde_json::to_vec(&serde_json::json!({"duration_seconds":seconds,"channel_count":2,"sample_count_by_channel":{"A0":0,"A2":0},"valid_filtered_count_by_channel":{"A0":0,"A2":0},"missing_count_by_channel":{"A0":0,"A2":0},"lost_sample_count":0,"invalid_packet_count":0,"outlier_count":0,"saturation_count":0,"disconnection_count":0,"continuous_segment_count":1,"sample_rate_hz":rate,"sample_rate_source":"confirmed","channels":{},"warnings":[],"dominant_band_by_channel":{}})).expect("json")).expect("summary");
         fs::write(dir.join("summary.md"), "fixture").expect("md");
         let mut processed = csv::Writer::from_path(dir.join("processed.csv")).expect("processed");
@@ -880,6 +995,10 @@ mod tests {
                 "channel",
                 "raw",
                 "filtered",
+                "segment_id",
+                "sample_valid",
+                "filter_warmup",
+                "artifact_rejected",
                 "quality",
                 "flags",
             ])
@@ -903,6 +1022,10 @@ mod tests {
                         } else {
                             value.to_string()
                         },
+                        "0".into(),
+                        (!gap || n != count / 2).to_string(),
+                        "false".into(),
+                        (gap && n == count / 2).to_string(),
                         "Good".into(),
                         String::new(),
                     ])
@@ -910,7 +1033,7 @@ mod tests {
             }
         }
         processed.flush().expect("flush");
-        for (file,header) in [("spectrum.csv","window_index,window_start_ns,window_end_ns,channel,frequency_hz,raw_psd,filtered_psd\n"),("band-power.csv","window_index,window_start_ns,window_end_ns,channel,band,low_hz,high_hz,absolute,relative,smoothed,baseline_change_pct\n"),("quality-events.csv","timestamp_ns,channel,kind,severity,details\n")]{fs::write(dir.join(file),header).expect("file");}
+        for (file,header) in [("spectrum.csv","window_index,window_start_ns,window_end_ns,channel,segment_id,frequency_hz,raw_psd,filtered_psd,window_function,sample_count,frequency_resolution_hz\n"),("band-power.csv","window_index,window_start_ns,window_end_ns,channel,segment_id,band,low_hz,high_hz,absolute,relative,smoothed,baseline_change_pct,quality_status\n"),("quality-events.csv","timestamp_ns,channel,kind,severity,details\n"),("excluded-windows.csv","channel,segment_id,window_index,window_start_ns,window_end_ns,reason_codes,details\n")]{fs::write(dir.join(file),header).expect("file");}
         dir
     }
     fn config(root: &Path, condition: &Path, channels: &[&str]) -> PathBuf {
@@ -926,6 +1049,168 @@ mod tests {
             .map(|r| r.expect("row"))
             .collect()
     }
+    #[test]
+    fn analysis_and_plugin_share_candidate_grid_reasons_and_power() {
+        use core_types::{
+            ChannelSamples, Config as CoreConfig, RawSignalBlock, Sample as RawSample,
+        };
+        let root = temp("shared-grid");
+        let mut c = CoreConfig::default();
+        c.source.channels = 1;
+        c.source.sample_rate_hz = 100.0;
+        c.source.mains = 0.0;
+        c.processing.low_pass_hz = 45.0;
+        c.processing.notch = false;
+        c.processing.window_samples = 200;
+        c.processing.hop_samples = 50;
+        c.processing.filter_warmup_seconds = 0.1;
+        c.processing.outlier_step = 150.0;
+        c.processing.reject_low_quality_windows = false;
+        let mut paths = Vec::new();
+        for chunk in [1, 37, 800] {
+            let session = root.join(format!("native-{chunk}"));
+            let mut writer =
+                storage::SessionWriter::create_at(&session, &storage::Metadata::new(c.clone()))
+                    .expect("writer");
+            for (block_index, start) in (0..800).step_by(chunk).enumerate() {
+                let samples = (start..(start + chunk).min(800))
+                    .map(|index| {
+                        let sequence = index as u64 + u64::from(index >= 515);
+                        let value = if index == 237 {
+                            250.0
+                        } else {
+                            f64::from(index >= 515) * 200.0
+                                + (std::f64::consts::TAU * 10.0 * index as f64 / 100.0).sin()
+                        };
+                        RawSample {
+                            sequence,
+                            timestamp_ns: sequence * 10_000_000,
+                            value,
+                            flags: vec![],
+                        }
+                    })
+                    .collect();
+                writer
+                    .write_block(&RawSignalBlock {
+                        sequence: block_index as u64,
+                        started_at: start as u64 * 10_000_000,
+                        sample_rate_hz: 100.0,
+                        source: "synthetic".into(),
+                        synchronized_clock: true,
+                        flags: vec![],
+                        channels: vec![ChannelSamples {
+                            id: "A0".into(),
+                            device: "fixture".into(),
+                            samples,
+                        }],
+                    })
+                    .expect("block");
+            }
+            writer.flush().expect("flush");
+            let analysis = analysis::analyze(
+                analysis::AnalysisInput { path: session },
+                analysis::AnalysisOptions {
+                    output: Some(root.join(format!("analysis-{chunk}"))),
+                    ..Default::default()
+                },
+            )
+            .expect("analysis");
+            paths.push(analysis.directory);
+        }
+        for name in [
+            "processed.csv",
+            "spectrum.csv",
+            "band-power.csv",
+            "excluded-windows.csv",
+        ] {
+            let expected = fs::read(paths[0].join(name)).expect("file");
+            for directory in &paths[1..] {
+                assert_eq!(
+                    fs::read(directory.join(name)).expect("file"),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+        let output = root.join("plugin-output");
+        run(Arguments {
+            input: paths[0].clone(),
+            config: config(&root, &paths[0], &["A0"]),
+            output: output.clone(),
+        })
+        .expect("plugin");
+        let bundle = Bundle::open(&paths[0]).expect("bundle");
+        let expected_exclusions = bundle
+            .excluded_windows()
+            .expect("reader")
+            .expect("v2")
+            .map(|row| {
+                let row = row.expect("row");
+                (
+                    row.window_index,
+                    Some(row.segment_id),
+                    row.window_start_ns,
+                    row.window_end_ns,
+                    row.reason_codes,
+                )
+            })
+            .collect::<Vec<_>>();
+        let actual_exclusions = csv::Reader::from_path(output.join("excluded-windows.csv"))
+            .expect("csv")
+            .deserialize::<ExcludedWindow>()
+            .map(|row| row.expect("row"))
+            .filter(|row| row.condition == "background")
+            .map(|row| {
+                (
+                    row.window_index,
+                    row.segment_id,
+                    row.window_start_ns,
+                    row.window_end_ns,
+                    row.reason,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_exclusions, expected_exclusions);
+        let expected = bundle
+            .band_power()
+            .expect("bands")
+            .map(|row| row.expect("row"))
+            .filter(|row| row.low_hz == 8.0 && row.high_hz == 13.0)
+            .collect::<Vec<_>>();
+        assert!(!expected.is_empty());
+        let actual = csv::Reader::from_path(output.join("windowed-band-power.csv"))
+            .expect("csv")
+            .deserialize::<WindowPower>()
+            .map(|row| row.expect("row"))
+            .filter(|row| row.condition == "background" && row.band == "Mu")
+            .collect::<Vec<_>>();
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert_eq!(
+                (
+                    a.window_index,
+                    a.segment_id,
+                    a.window_start_ns,
+                    a.window_end_ns
+                ),
+                (
+                    b.window_index,
+                    Some(b.segment_id),
+                    b.window_start_ns,
+                    b.window_end_ns
+                )
+            );
+            assert!((a.power - b.absolute).abs() < 1e-12);
+        }
+        assert!(
+            actual
+                .iter()
+                .any(|row| row.window_start_ns == 248 * 10_000_000),
+            "off-hop artifact restarts grid after warmup"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn reduced_mu_is_negative_and_beta_is_measured() {
         let root = temp("decrease");
@@ -971,6 +1256,33 @@ mod tests {
         let windowed =
             fs::read_to_string(output.join("windowed-band-power.csv")).expect("window powers");
         assert!(!windowed.contains(root.to_string_lossy().as_ref()));
+        let powers: Vec<WindowPower> =
+            csv::Reader::from_path(output.join("windowed-band-power.csv"))
+                .expect("window powers")
+                .deserialize()
+                .map(|row| row.expect("window row"))
+                .collect();
+        let first_mu = powers
+            .iter()
+            .find(|row| {
+                row.condition == "background"
+                    && row.channel == "A0"
+                    && row.band == "Mu"
+                    && row.window_index == 0
+            })
+            .expect("first Mu window");
+        let samples = (0..200)
+            .map(|index| {
+                let time = index as f64 / 100.0;
+                128.0
+                    + 20.0 * (std::f64::consts::TAU * 10.0 * time).sin()
+                    + 2.0 * (std::f64::consts::TAU * 20.0 * time).sin()
+            })
+            .collect::<Vec<_>>();
+        let shared =
+            one_sided_psd(&samples, 100.0, WindowFunction::HannSymmetric).expect("shared PSD");
+        let expected = integrate_band_power(&shared, 8.0, 13.0).expect("shared Mu power");
+        assert!((first_mu.power - expected).abs() < 1e-12);
         let _ = fs::remove_dir_all(root);
     }
     #[test]
@@ -981,7 +1293,11 @@ mod tests {
         let processed_path = condition.join("processed.csv");
         let processed = fs::read_to_string(&processed_path)
             .expect("processed")
-            .replacen(",Good,", ",Poor,", 1);
+            .replacen(
+                ",true,false,false,Good,",
+                ",false,false,false,Poor,LowQuality",
+                1,
+            );
         fs::write(&processed_path, processed).expect("processed");
         let output = root.join("output");
         run(Arguments {
@@ -998,10 +1314,10 @@ mod tests {
                 .collect();
         assert!(excluded
             .iter()
-            .any(|r| r.condition == "condition" && r.reason.contains("missing filtered")));
+            .any(|r| r.condition == "condition" && r.reason.contains("MissingFilteredSample")));
         assert!(excluded
             .iter()
-            .any(|r| r.condition == "condition" && r.reason.contains("quality label")));
+            .any(|r| r.condition == "condition" && r.reason.contains("IneligibleSample")));
         let _ = fs::remove_dir_all(root);
     }
     #[test]
@@ -1019,6 +1335,13 @@ mod tests {
             let mut manifest: serde_json::Value =
                 serde_json::from_reader(File::open(&manifest_path).expect("manifest"))
                     .expect("manifest JSON");
+            manifest
+                .as_object_mut()
+                .expect("object")
+                .remove("windowing_algorithm_version");
+            manifest["analysis_format_version"] = serde_json::json!(1);
+            manifest["dsp_algorithm_version"] = serde_json::json!(1);
+            manifest["psd_algorithm_version"] = serde_json::json!(1);
             manifest["analysis_warnings"] =
                 serde_json::json!(["Quality uses one-sample blocks independently per channel."]);
             fs::write(
@@ -1092,7 +1415,7 @@ mod tests {
         assert!(!output.join("figures/mu-band-comparison.png").exists());
         assert!(fs::read_to_string(output.join("excluded-windows.csv"))
             .expect("excluded")
-            .starts_with("bundle,condition"));
+            .starts_with("dsp_algorithm_version,bundle,condition"));
         let _ = fs::remove_dir_all(root);
     }
 }

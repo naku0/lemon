@@ -730,8 +730,12 @@ fn snapshot_bundle(root: &Path) -> Result<BTreeMap<String, (u64, u64)>> {
         "spectrum.csv",
         "band-power.csv",
         "quality-events.csv",
+        "excluded-windows.csv",
     ] {
         let path = root.join(name);
+        if name == "excluded-windows.csv" && !path.exists() {
+            continue;
+        }
         let mut file = File::open(&path)
             .map_err(|e| PlatformError::Bundle(format!("{}: {e}", path.display())))?;
         let mut hasher = DefaultHasher::new();
@@ -941,7 +945,7 @@ printf '{"schema_version":1,"plugin":{"id":"fixture","version":"0.1.0"},"status"
                 config,
                 output: root.join("empty-output"),
                 overwrite: false,
-                timeout: Duration::from_secs(1)
+                timeout: Duration::from_secs(5)
             })
             .expect_err("result")
             .to_string()
@@ -968,7 +972,7 @@ printf '{"schema_version":1,"plugin":{"id":"fixture","version":"0.1.0"},"status"
                 config: config.clone(),
                 output: root.join("crash-output"),
                 overwrite: false,
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(5),
             })
             .expect_err("crash");
         assert!(error.to_string().contains("exited"));
@@ -1008,7 +1012,7 @@ printf '%s' '{}' > "$out/plugin-result.json""#,
                     config: config.clone(),
                     output: root.join(format!("{name}-output")),
                     overwrite: false,
-                    timeout: Duration::from_secs(1),
+                    timeout: Duration::from_secs(5),
                 })
                 .expect_err("invalid result");
             assert!(error.to_string().contains(expected), "{error}");

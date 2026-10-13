@@ -20,6 +20,7 @@ pub enum SignalFlag {
     LowQuality,
     ChannelMismatch,
     InsufficientData,
+    FilterWarmup,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalQuality {
@@ -64,6 +65,10 @@ pub struct ChannelSpectrum {
     pub raw_psd: Vec<f64>,
     pub filtered_psd: Vec<f64>,
     pub mains_ratio: f64,
+    pub segment_id: u64,
+    pub sample_count: usize,
+    pub frequency_resolution_hz: f64,
+    pub window_function: WindowFunction,
 }
 #[derive(Debug, Clone)]
 pub struct SpectrumSnapshot {
@@ -80,6 +85,16 @@ pub struct BandPower {
     pub smoothed: f64,
     pub baseline_change_pct: Option<f64>,
     pub asymmetry: Option<f64>,
+    pub segment_id: u64,
+    pub quality_status: SignalQuality,
+}
+#[derive(Debug, Clone)]
+pub struct ProcessedSampleMetadata {
+    pub segment_id: u64,
+    pub sample_valid: bool,
+    pub filter_warmup: bool,
+    pub artifact_rejected: bool,
+    pub flags: Vec<SignalFlag>,
 }
 #[derive(Debug, Clone)]
 pub struct ProcessedSignalBlock {
@@ -88,6 +103,8 @@ pub struct ProcessedSignalBlock {
     pub sample_rate_hz: f64,
     pub raw_channels: Vec<ChannelSamples>,
     pub filtered_channels: Vec<FilteredChannel>,
+    /// Per channel and sample, aligned with `filtered_channels` and `raw_channels`.
+    pub sample_metadata: Vec<Vec<ProcessedSampleMetadata>>,
     pub channel_quality: Vec<SignalQuality>,
     pub spectrum: Option<SpectrumSnapshot>,
     pub band_power: Option<Vec<BandPower>>,
@@ -96,6 +113,20 @@ pub struct ProcessedSignalBlock {
     pub invalid_samples: u64,
     pub outliers: u64,
     pub skew_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPolicy {
+    #[default]
+    RejectAndReset,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowFunction {
+    #[default]
+    HannSymmetric,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -360,6 +391,10 @@ pub struct ProcessingConfig {
     pub flat_stddev: f64,
     pub mains_ratio_limit: f64,
     pub sync_tolerance_ms: f64,
+    pub artifact_policy: ArtifactPolicy,
+    pub filter_warmup_seconds: f64,
+    pub window_function: WindowFunction,
+    pub reject_low_quality_windows: bool,
     /// Per channel, per band; power in units squared. Empty means no baseline.
     pub baseline: Vec<Vec<f64>>,
 }
@@ -396,6 +431,10 @@ impl Default for ProcessingConfig {
             flat_stddev: 0.01,
             mains_ratio_limit: 0.2,
             sync_tolerance_ms: 4.,
+            artifact_policy: ArtifactPolicy::RejectAndReset,
+            filter_warmup_seconds: 2.0,
+            window_function: WindowFunction::HannSymmetric,
+            reject_low_quality_windows: true,
             baseline: Vec::new(),
         }
     }
@@ -446,6 +485,13 @@ impl Config {
             || p.hop_samples > p.window_samples
         {
             return Err("window_samples: 8..65536; hop_samples: 1..window_samples".into());
+        }
+        if !p.filter_warmup_seconds.is_finite()
+            || p.filter_warmup_seconds < 0.0
+            || !(p.filter_warmup_seconds * s.sample_rate_hz).is_finite()
+            || p.filter_warmup_seconds * s.sample_rate_hz >= usize::MAX as f64
+        {
+            return Err("filter_warmup_seconds: expected a finite value >= 0".into());
         }
         let nyquist = fs / 2.;
         if !p.high_pass_hz.is_finite()
@@ -637,5 +683,25 @@ impl Default for RuntimeStatus {
             consumer_blocks: 0,
             consumer_dropped: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_processing_json_receives_v2_defaults() {
+        let mut value = serde_json::to_value(ProcessingConfig::default()).expect("serialize");
+        let object = value.as_object_mut().expect("object");
+        object.remove("artifact_policy");
+        object.remove("filter_warmup_seconds");
+        object.remove("window_function");
+        object.remove("reject_low_quality_windows");
+        let processing: ProcessingConfig = serde_json::from_value(value).expect("legacy JSON");
+        assert_eq!(processing.artifact_policy, ArtifactPolicy::RejectAndReset);
+        assert_eq!(processing.filter_warmup_seconds, 2.0);
+        assert_eq!(processing.window_function, WindowFunction::HannSymmetric);
+        assert!(processing.reject_low_quality_windows);
     }
 }

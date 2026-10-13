@@ -444,11 +444,8 @@ fn waveform(f: &mut Frame, area: Rect, v: &View, status: &RuntimeStatus, c: &Con
     }
 }
 fn spectrum(f: &mut Frame, area: Rect, v: &View, c: &Config, p: &Palette) {
-    let Some(s) = &v.spectrum else {
-        para(f,area,"Spectrum",format!("Accumulating a contiguous FFT window: {} samples ({:.2} s).\nAfter gaps, old spectra are cleared.\nRaw and Filtered PSD will appear here.",c.processing.window_samples,c.processing.window_samples as f64/c.source.sample_rate_hz),v);
-        return;
-    };
-    let indices: Vec<_> = (0..s.channels.len()).filter(|i| v.selected(*i)).collect();
+    // Panel positions follow acquisition channels, never the number of ready FFTs.
+    let indices: Vec<_> = (0..c.source.channels).filter(|i| v.selected(*i)).collect();
     if indices.is_empty() {
         para(
             f,
@@ -472,7 +469,38 @@ fn spectrum(f: &mut Frame, area: Rect, v: &View, c: &Config, p: &Palette) {
         }
     };
     for (row, &i) in indices.iter().enumerate() {
-        let ch = &s.channels[i];
+        let id = v
+            .latest
+            .as_ref()
+            .and_then(|block| block.raw_channels.get(i))
+            .map(|channel| channel.id.clone())
+            .unwrap_or_else(|| format!("ch{}", i + 1));
+        let ready = v.spectrum.as_ref().and_then(|spectrum| {
+            spectrum
+                .channels
+                .iter()
+                .find(|channel| channel.channel == id)
+                .map(|channel| (spectrum, channel))
+        });
+        let Some((s, ch)) = ready else {
+            let warming = v
+                .latest
+                .as_ref()
+                .and_then(|block| block.sample_metadata.get(i))
+                .and_then(|samples| samples.last())
+                .is_some_and(|sample| sample.filter_warmup);
+            let state = if v.source_finished_seen {
+                "Source stopped"
+            } else if warming {
+                "Filter warmup"
+            } else {
+                "Waiting for valid window"
+            };
+            para(f, areas[row], &format!("{id} | {state}"), format!(
+                "No current PSD. A contiguous window of {} samples ({:.2} s) is required after warmup.\nInvalidated spectra are not displayed.",
+                c.processing.window_samples, c.processing.window_samples as f64 / c.source.sample_rate_hz), v);
+            continue;
+        };
         let raw: Vec<_> = s
             .frequencies
             .iter()

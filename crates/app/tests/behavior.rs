@@ -211,7 +211,8 @@ fn psd_recovers_tone_power_relative_power_and_baseline() {
 }
 #[test]
 fn notch_reduces_fifty_hz_while_preserving_ten_hz() {
-    let c = config();
+    let mut c = config();
+    c.processing.reject_low_quality_windows = false;
     let mut enabled = Processor::new(&c).expect("processor");
     let mut off = c.clone();
     off.processing.notch = false;
@@ -262,16 +263,16 @@ fn artifacts_and_channel_skew_affect_quality_and_disable_asymmetry() {
     assert!(output.flags.contains(&SignalFlag::ChannelMismatch));
     assert_eq!(output.skew_ms, Some(20.));
     assert!(output.channel_quality.contains(&SignalQuality::Poor));
-    assert!(output
-        .band_power
-        .expect("bands")
-        .iter()
-        .all(|b| b.asymmetry.is_none()));
+    assert!(
+        output.band_power.is_none(),
+        "artifact- and skew-affected windows must not produce band power"
+    );
 }
 #[test]
 fn asymmetry_exists_for_synchronized_channels() {
     let mut c = Config::default();
     c.source.block_size = 1000;
+    c.processing.reject_low_quality_windows = false;
     let input = Synthetic::new(c.source.clone()).generate().expect("block");
     let output = Processor::new(&c)
         .expect("processor")
@@ -629,9 +630,11 @@ fn within_block_misalignment_disables_asymmetry_even_if_last_samples_match() {
         .process(block)
         .expect("output");
     assert!(output.flags.contains(&SignalFlag::ChannelMismatch));
-    assert!(output
-        .band_power
-        .expect("powers")
-        .iter()
-        .all(|b| b.asymmetry.is_none()));
+    assert!(
+        output
+            .band_power
+            .as_ref()
+            .is_some_and(|powers| powers.iter().all(|power| power.asymmetry.is_none())),
+        "independent channel spectra remain usable; misalignment forbids asymmetry"
+    );
 }

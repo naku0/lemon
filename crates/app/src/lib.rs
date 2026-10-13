@@ -341,6 +341,7 @@ impl Worker {
                             for flag in &processed.flags {
                                 if *flag != SignalFlag::InsufficientData
                                     && *flag != SignalFlag::LowQuality
+                                    && *flag != SignalFlag::FilterWarmup
                                 {
                                     if let Err(e) = self.event(
                                         &format!("{flag:?}"),

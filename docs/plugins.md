@@ -131,7 +131,9 @@ for row in bundle.processed()? {
 }
 ```
 
-Доступны `processed`, `spectrum`, `band_power`, `quality_events`, а также типы `PluginResult`, `Artifact` и атомарная `write_plugin_result`. SDK не зависит от TUI и не раскрывает состояние DSP.
+Доступны `processed`, `spectrum`, `band_power`, `quality_events`, `excluded_windows`, а также типы `PluginResult`, `Artifact` и атомарная `write_plugin_result`. Для Bundle v2 строки `processed` содержат `segment_id`, `sample_valid`, `filter_warmup` и `artifact_rejected`. SDK не зависит от TUI и не раскрывает состояние DSP.
+
+Плагин, которому нужна новая спектральная оценка поверх пригодного Filtered, должен использовать публичные `processing::one_sided_psd` и `processing::integrate_band_power`. Это сохраняет одну версию centering, symmetric Hann, one-sided нормировки и границ диапазонов. Плагин обязан сравнить `dsp_algorithm_version`, `psd_algorithm_version`, `processing_mode`, окно и шаг входных bundle.
 
 Example находится в `examples/plugins/example-summary/`:
 
@@ -246,4 +248,18 @@ open reports/lab2-mu-condition-results/figures/mu-band-comparison.png
 - `excluded-windows.csv` — исключённые интервалы и причины;
 - `figures/` — отдельные Mu/Beta и временные графики.
 
+Для v2 плагин принимает только строки `sample_valid=true`, не объединяет разные `segment_id`, читает `excluded-windows.csv` и использует общий PSD из `processing`. Для v1 ограничения пригодности определяются по доступным флагам, значениям и времени с явным предупреждением.
+
+В summary отдельно сохранены версии PSD исходных bundle и `computed_psd_algorithm_version` — версия вычисления новых окон плагином. Там же находятся конфигурации обработки входов и счётчики причин исключения исходного анализа. Эти счётчики не суммируются с исключениями собственной сетки плагина: окна могут отличаться.
+
+Несовместимые частоты, единицы, фильтры, пороги артефактов/качества, прогрев, окно, шаг, диапазоны и версии DSP отклоняются. Различия второстепенных параметров явно перечисляются предупреждением. Mu-плагин пока хранит выбранные Filtered и оконные мощности в памяти; для очень больших наборов потребуется отдельная потоковая доработка.
+
 Это condition comparison между отдельными файлами. Результат не называется MuERD/ERD/ERS: для event-locked анализа нужны метки `baseline`, `cue`, `task` и идентификаторы trial внутри общей временной шкалы. Полная методика описана в [README плагина](../plugins/mu-condition-analysis/README.md).
+
+### Общая сетка окон
+
+Для собственных окон поверх Filtered используйте `processing::windows::{AnalysisSample, WindowingConfig, WindowGenerator}`. Передайте строку через `push`, обработайте `Accepted`/`Rejected` и вызовите `finish` в конце канала. Принятый кандидат содержит значения для `one_sided_psd`; исключённый — типизированные причины с постоянными CSV-кодами.
+
+Mu-плагин использует этот же путь. Для Bundle v2 per-sample metadata является основой пригодности; события агрегированного качества не применяются второй раз. Для v1 адаптер восстанавливает сегменты по sequence/time, учитывает доступные флаги и совпадающие по времени известные события; менее строгая оценка отмечается предупреждением.
+
+Плагин сверяет `windowing_algorithm_version` входных bundle. При его отсутствии вход отмечается старой версией 0; текущая сетка плагина — 1. DSP v2 и v3 нельзя смешивать в одном сравнении: повторно выполните `lemon analyze` для всех условий.

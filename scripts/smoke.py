@@ -140,7 +140,8 @@ def tui_run(config, exit_key, record):
         if record:
             os.write(master, b"r")
             wait_for(master, output, "REC")
-            hold(master, output, 2.3)
+            # Default DSP needs 2 s filter warmup plus a 2 s FFT window.
+            hold(master, output, 4.3)
             os.write(master, b"mtest marker\r")
             wait_for(master, output, "Marker saved")
             os.write(master, b" ")  # visualization pause must not pause recording
@@ -184,7 +185,7 @@ def tui_run(config, exit_key, record):
             (ROOT / "target/tui-smoke.ansi").write_bytes(output)
     finally:
         if proc.poll() is None:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
         os.close(master)
         os.close(slave)
@@ -223,6 +224,9 @@ def main():
         tmp = Path(tmp)
         config = json.loads((ROOT / "examples/synthetic.json").read_text())
         config["recording_dir"] = str(tmp / "recordings")
+        # This smoke checks TUI spectrum rendering; low-quality rejection has
+        # dedicated Rust tests and would intentionally suppress this noisy demo PSD.
+        config["processing"]["reject_low_quality_windows"] = False
         path = tmp / "config.json"
         path.write_text(json.dumps(config))
         output = tui_run(path, b"q", True)

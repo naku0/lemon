@@ -13,6 +13,10 @@ use std::{
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const RESULT_SCHEMA_VERSION: u32 = 1;
 
+fn legacy_dsp_version() -> u32 {
+    1
+}
+
 #[derive(Debug)]
 pub enum SdkError {
     Bundle(String),
@@ -72,6 +76,20 @@ pub struct Manifest {
     pub analysis_warnings: Vec<String>,
     #[serde(default)]
     pub time_normalization: String,
+    #[serde(default = "legacy_dsp_version")]
+    pub dsp_algorithm_version: u32,
+    #[serde(default)]
+    pub windowing_algorithm_version: u32,
+    #[serde(default = "legacy_dsp_version")]
+    pub psd_algorithm_version: u32,
+    #[serde(default)]
+    pub processing_mode: String,
+    #[serde(default)]
+    pub window_function: String,
+    #[serde(default)]
+    pub filter_warmup_seconds: f64,
+    #[serde(default)]
+    pub reject_low_quality_windows: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +142,13 @@ impl Bundle {
     }
     pub fn quality_events(&self) -> Result<CsvRows<QualityEventRow>, SdkError> {
         self.rows("quality-events.csv")
+    }
+    pub fn excluded_windows(&self) -> Result<Option<CsvRows<ExcludedWindowRow>>, SdkError> {
+        let path = self.directory.join("excluded-windows.csv");
+        if !path.is_file() && self.manifest.analysis_format_version < 2 {
+            return Ok(None);
+        }
+        CsvRows::open(path).map(Some)
     }
     fn rows<T: DeserializeOwned>(&self, name: &str) -> Result<CsvRows<T>, SdkError> {
         CsvRows::open(self.directory.join(name))
@@ -178,6 +203,14 @@ pub struct ProcessedRow {
     pub channel: String,
     pub raw: f64,
     pub filtered: Option<f64>,
+    #[serde(default)]
+    pub segment_id: u64,
+    #[serde(default = "default_true")]
+    pub sample_valid: bool,
+    #[serde(default)]
+    pub filter_warmup: bool,
+    #[serde(default)]
+    pub artifact_rejected: bool,
     pub quality: String,
     pub flags: String,
 }
@@ -187,9 +220,17 @@ pub struct SpectrumRow {
     pub window_start_ns: u64,
     pub window_end_ns: u64,
     pub channel: String,
+    #[serde(default)]
+    pub segment_id: u64,
     pub frequency_hz: f64,
     pub raw_psd: f64,
     pub filtered_psd: Option<f64>,
+    #[serde(default)]
+    pub window_function: String,
+    #[serde(default)]
+    pub sample_count: usize,
+    #[serde(default)]
+    pub frequency_resolution_hz: f64,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct BandPowerRow {
@@ -197,6 +238,8 @@ pub struct BandPowerRow {
     pub window_start_ns: u64,
     pub window_end_ns: u64,
     pub channel: String,
+    #[serde(default)]
+    pub segment_id: u64,
     pub band: String,
     pub low_hz: f64,
     pub high_hz: f64,
@@ -204,6 +247,8 @@ pub struct BandPowerRow {
     pub relative: f64,
     pub smoothed: Option<f64>,
     pub baseline_change_pct: Option<f64>,
+    #[serde(default)]
+    pub quality_status: String,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct QualityEventRow {
@@ -212,6 +257,21 @@ pub struct QualityEventRow {
     pub kind: String,
     pub severity: String,
     pub details: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExcludedWindowRow {
+    pub channel: String,
+    pub segment_id: u64,
+    pub window_index: u64,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub reason_codes: String,
+    pub details: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -380,6 +440,9 @@ mod tests {
         let b = Bundle::open(&p).expect("bundle");
         assert_eq!(b.channels(), &["A0"]);
         assert_eq!(b.sample_rate_hz(), 250.0);
+        assert_eq!(b.manifest().dsp_algorithm_version, 1);
+        assert_eq!(b.manifest().psd_algorithm_version, 1);
+        assert!(b.excluded_windows().expect("excluded").is_none());
         let rows = b
             .processed()
             .expect("rows")
@@ -387,6 +450,7 @@ mod tests {
             .expect("csv");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].raw, 1.5);
+        assert!(rows[0].sample_valid);
         let _ = fs::remove_dir_all(p);
     }
     #[test]

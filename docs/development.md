@@ -34,6 +34,17 @@ python3 scripts/smoke.py
 python3 scripts/report_smoke.py
 ```
 
+После изменения DSP отдельно проверьте публичную спектральную математику и формат bundle:
+
+```bash
+cargo test --locked -p processing
+cargo test --locked -p analysis
+cargo test --locked -p lemon-plugin-sdk
+cargo test --locked -p mu-condition-analysis
+```
+
+Тесты должны покрывать артефакты до фильтров, warmup после старта и сброса, segment ID, PSD-нормировку и чтение старого Bundle v1.
+
 Для небольшой правки сначала можно запустить тест изменённого crate, затем обязательно выполнить проверки workspace перед завершением задачи:
 
 ```bash
@@ -78,3 +89,5 @@ lemon report --help
 lemon plugins --help
 lemon plugin run --help
 ```
+
+Регрессия DSP v3 проверяет восстановление нового уровня после пропуска, отключения, InvalidPacket, смены источника и явного reset. Сквозной тест Mu-плагина создаёт синтетическую native session блоками 1/37/800 отсчётов: после выброса вне hop-сетки, прогрева и разрыва `analyze` и плагин должны совпасть по индексам, границам, segment ID, причинам исключения и мощности. Реальные записи не нужны.

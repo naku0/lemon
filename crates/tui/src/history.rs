@@ -30,7 +30,9 @@ impl BandHistory {
                     SignalFlag::LostSample
                         | SignalFlag::InvalidPacket
                         | SignalFlag::Disconnected
-                        | SignalFlag::InsufficientData
+                        | SignalFlag::Outlier
+                        | SignalFlag::Saturation
+                        | SignalFlag::FilterWarmup
                 )
             })
         {
@@ -90,10 +92,12 @@ impl BandHistory {
                 PowerMode::Baseline => point.power.baseline_change_pct,
             }
             .filter(|v| v.is_finite());
-            if (segment != Some(point.segment) || value.is_none()) && !line.is_empty() {
+            if (segment != Some((point.segment, point.power.segment_id)) || value.is_none())
+                && !line.is_empty()
+            {
                 result.push(std::mem::take(&mut line));
             }
-            segment = Some(point.segment);
+            segment = Some((point.segment, point.power.segment_id));
             if let Some(value) = value {
                 line.push((point.time, value));
             }
@@ -119,6 +123,8 @@ mod tests {
                 smoothed: 1.8,
                 baseline_change_pct: baseline,
                 asymmetry: None,
+                segment_id: segment,
+                quality_status: core_types::SignalQuality::Good,
             },
         }
     }

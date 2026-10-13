@@ -226,7 +226,11 @@ fn hash_manifest(path: &Path) -> Result<String, ReportError> {
         "spectrum.csv",
         "band-power.csv",
         "quality-events.csv",
+        "excluded-windows.csv",
     ] {
+        if name == "excluded-windows.csv" && !path.join(name).is_file() {
+            continue;
+        }
         h.update(name.as_bytes());
         let mut f =
             fs::File::open(path.join(name)).map_err(|e| format!("report/hash {name}: {e}"))?;
@@ -251,8 +255,12 @@ fn copy_analysis(src: &Path, dst: &Path) -> Result<(), ReportError> {
         "spectrum.csv",
         "band-power.csv",
         "quality-events.csv",
+        "excluded-windows.csv",
     ] {
         let from = src.join(name);
+        if name == "excluded-windows.csv" && !from.is_file() {
+            continue;
+        }
         fs::copy(&from, dst.join(name))
             .map_err(|e| format!("report/analysis {}: {e}", from.display()))?;
     }
@@ -520,6 +528,7 @@ pub fn render_notebook(
                             "spectrum.csv",
                             "band-power.csv",
                             "quality-events.csv",
+                            "excluded-windows.csv",
                         ]
                         .contains(&name.as_ref())
                     } else {

@@ -9,7 +9,9 @@ SignalSource → bounded queue → Raw storage → Processor → Broadcast
                                       └── optional consumers
 ```
 
-`source` получает и декодирует данные. `storage` сохраняет Raw до DSP. `processing` выполняет проверку, фильтры, PSD, band power и quality. `analysis` сохраняет численный AnalysisBundle. `report` представляет готовые данные и не повторяет DSP.
+`source` получает и декодирует данные. `storage` сохраняет Raw до DSP. `processing` выполняет проверку, классификацию артефактов, причинные фильтры, warmup, PSD, band power и quality. `analysis` сохраняет численный AnalysisBundle. `report` представляет готовые данные и не повторяет DSP.
+
+Публичный шов спектральной математики находится в `processing::one_sided_psd`. Processor и аналитические плагины используют одну реализацию symmetric Hann, one-sided нормировки и интегрирования диапазонов. При разрыве состояние фильтров, спектральный буфер и EMA сбрасываются; новый `segment_id` не объединяется с предыдущим.
 
 Plugin Platform находится после `analysis`:
 
@@ -28,5 +30,8 @@ AnalysisBundle ──→ report
 - Медленный необязательный consumer получает счётчик dropped.
 - Пауза TUI останавливает отображение, но не запись и обработку.
 - DSP-конфигурация не меняется через визуальные настройки активной записи.
+- Аналитические окна состоят только из пригодных post-warmup отсчётов одного сегмента.
 
 Workspace разделён на `core`, `source`, `processing`, `storage`, `analysis`, `report`, `plugins`, `lemon-plugin-sdk`, `tui` и `app`. TUI, report и Plugin Platform не являются зависимостями DSP.
+
+Общий `processing::windows` формирует принятие и исключение кандидатов для `analysis` и Mu-плагина. Буфер ограничен одним окном; незавершённый хвост выдаётся один раз. Сброс непрерывности очищает опорное Raw, а сброс после Outlier/Saturation сохраняет его. Новая семантика отмечена DSP v3 / windowing v1 без изменения файлового формата AnalysisBundle v2.

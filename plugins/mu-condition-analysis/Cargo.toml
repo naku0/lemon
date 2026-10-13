@@ -12,5 +12,9 @@ lemon-plugin-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 csv.workspace = true
-rustfft.workspace = true
+processing.workspace = true
 
+[dev-dependencies]
+analysis.workspace = true
+core_types.workspace = true
+storage.workspace = true

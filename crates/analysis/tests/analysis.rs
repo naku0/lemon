@@ -34,6 +34,8 @@ fn config() -> Config {
     c.processing.hop_samples = 16;
     c.processing.low_pass_hz = 80.;
     c.processing.notch = false;
+    // Most legacy analysis tests isolate spectral/window behavior from warmup.
+    c.processing.filter_warmup_seconds = 0.0;
     c
 }
 fn session(dir: &Path, block_size: usize, hz: f64) -> PathBuf {
@@ -151,9 +153,18 @@ fn bundle_has_all_files_and_neutral_summary() {
         "spectrum.csv",
         "band-power.csv",
         "quality-events.csv",
+        "excluded-windows.csv",
     ] {
         assert!(b.directory.join(name).is_file(), "{name}");
     }
+    let manifest: serde_json::Value = serde_json::from_reader(
+        fs::File::open(b.directory.join("manifest.json")).expect("manifest"),
+    )
+    .expect("manifest JSON");
+    assert_eq!(manifest["analysis_format_version"], 2);
+    assert_eq!(manifest["dsp_algorithm_version"], 3);
+    assert_eq!(manifest["windowing_algorithm_version"], 1);
+    assert_eq!(manifest["processing_mode"], "causal_live_compatible");
     let md = fs::read_to_string(b.directory.join("summary.md"))
         .expect("md")
         .to_lowercase();
@@ -170,6 +181,37 @@ fn bundle_has_all_files_and_neutral_summary() {
     ] {
         assert!(!md.contains(forbidden), "forbidden {forbidden}");
     }
+}
+
+#[test]
+fn warmup_is_machine_readable_in_processed_and_excluded_windows() {
+    let t = Temp::new();
+    let input = session(&t.0, 16, 10.0);
+    let mut c = config();
+    c.processing.filter_warmup_seconds = 0.25;
+    let bundle = analyze(
+        AnalysisInput { path: input },
+        AnalysisOptions {
+            output: Some(t.0.join("warmup")),
+            config: Some(c),
+            ..Default::default()
+        },
+    )
+    .expect("analysis");
+    let processed = fs::read_to_string(bundle.directory.join("processed.csv")).expect("processed");
+    assert!(processed.lines().next().is_some_and(|header| {
+        header.contains("segment_id")
+            && header.contains("sample_valid")
+            && header.contains("filter_warmup")
+    }));
+    let excluded =
+        fs::read_to_string(bundle.directory.join("excluded-windows.csv")).expect("excluded");
+    assert!(excluded.contains("FilterWarmup"));
+    assert!(bundle
+        .summary
+        .excluded_window_reasons
+        .keys()
+        .any(|reason| reason.contains("FilterWarmup")));
 }
 #[test]
 fn overwrite_is_scoped_and_missing_window_is_explicit() {
@@ -261,6 +303,7 @@ fn asynchronous_channels_keep_all_windows_and_gaps() {
     let t = Temp::new();
     let mut c = config();
     c.source.channels = 2;
+    c.processing.reject_low_quality_windows = false;
     let p = t.0.join("input");
     let mut w = SessionWriter::create_at(&p, &Metadata::new(c.clone())).expect("writer");
     let samples = |count: usize, skip: bool| {
@@ -341,6 +384,7 @@ fn notch_and_band_ranking_use_existing_dsp_outputs() {
     let mut c = config();
     c.processing.window_samples = 256;
     c.processing.hop_samples = 64;
+    c.processing.reject_low_quality_windows = false;
     let off = analyze(
         AnalysisInput {
             path: input.clone(),
@@ -364,7 +408,12 @@ fn notch_and_band_ranking_use_existing_dsp_outputs() {
     .expect("on");
     let a = &off.summary.channels["ch1"];
     let b = &on.summary.channels["ch1"];
-    assert!(b.mains_power_after < a.mains_power_after * 0.15);
+    assert!(
+        b.mains_power_after < a.mains_power_after * 0.15,
+        "notch off={} on={}",
+        a.mains_power_after,
+        b.mains_power_after
+    );
     let alpha = |c: &analysis::ChannelSummary| {
         c.band_statistics
             .values()
@@ -448,4 +497,70 @@ fn spectral_window_bounds_follow_actual_sample_timestamps() {
             .len(),
         5
     );
+}
+
+#[test]
+fn short_warmup_and_unfinished_tail_are_not_silently_dropped() {
+    let t = Temp::new();
+    let input = session(&t.0, 37, 10.0);
+    let mut c = config();
+    c.processing.filter_warmup_seconds = 3.0 / 256.0;
+    let bundle = analyze(
+        AnalysisInput { path: input },
+        AnalysisOptions {
+            output: Some(t.0.join("short-warmup")),
+            config: Some(c),
+            ..Default::default()
+        },
+    )
+    .expect("analysis");
+    let mut excluded =
+        csv::Reader::from_path(bundle.directory.join("excluded-windows.csv")).expect("csv");
+    let exclusions = excluded
+        .records()
+        .map(|row| row.expect("row"))
+        .collect::<Vec<_>>();
+    assert_eq!(exclusions.len(), 2);
+    assert!(exclusions[0][5].contains("FilterWarmup"));
+    assert!(exclusions[0][5].contains("InsufficientData"));
+    assert_eq!(exclusions[0][3], "0".to_string());
+    assert_eq!(exclusions[0][4], (2 * 3_906_250).to_string());
+    assert!(exclusions[1][5].contains("InsufficientData"));
+    let mut indices = exclusions
+        .iter()
+        .map(|row| row[2].parse::<u64>().expect("index"))
+        .collect::<Vec<_>>();
+    let mut spectrum = csv::Reader::from_path(bundle.directory.join("spectrum.csv")).expect("csv");
+    let mut valid = std::collections::BTreeSet::new();
+    for row in spectrum.records() {
+        valid.insert(row.expect("row")[0].parse::<u64>().expect("index"));
+    }
+    indices.extend(valid);
+    indices.sort_unstable();
+    assert_eq!(indices, (0..indices.len() as u64).collect::<Vec<_>>());
+    assert_eq!(
+        bundle.summary.excluded_spectral_window_count_by_channel["ch1"],
+        2
+    );
+}
+
+#[test]
+fn v2_cannot_silently_default_missing_eligibility_columns() {
+    let t = Temp::new();
+    let input = session(&t.0, 37, 10.0);
+    let bundle = analyze(
+        AnalysisInput { path: input },
+        AnalysisOptions {
+            output: Some(t.0.join("schema")),
+            ..Default::default()
+        },
+    )
+    .expect("analysis");
+    analysis::AnalysisBundle::open(&bundle.directory).expect("valid v2");
+    let path = bundle.directory.join("processed.csv");
+    let original = fs::read_to_string(&path).expect("csv");
+    fs::write(&path, original.replacen("sample_valid", "unrecognized", 1)).expect("write");
+    let error =
+        analysis::AnalysisBundle::open(&bundle.directory).expect_err("v2 eligibility required");
+    assert!(error.contains("sample_valid"));
 }

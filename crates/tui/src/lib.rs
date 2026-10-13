@@ -151,23 +151,43 @@ impl View {
         if self.paused {
             return;
         }
-        let discontinuity = self
+        let missed_display_blocks = self
             .latest
             .as_ref()
-            .is_some_and(|last| b.sequence != last.sequence.saturating_add(1))
-            || b.flags.iter().any(|f| {
-                matches!(
-                    f,
-                    SignalFlag::InsufficientData
-                        | SignalFlag::LostSample
-                        | SignalFlag::InvalidPacket
-                        | SignalFlag::Disconnected
-                )
-            });
-        if discontinuity {
-            self.spectrum = None;
-            self.bands.clear();
+            .is_some_and(|last| b.sequence != last.sequence.saturating_add(1));
+        // A pending FFT is not a discontinuity. Invalidate only channels whose
+        // DSP state was reset; another channel can still have a usable frame.
+        let invalidated: Vec<_> = b
+            .raw_channels
+            .iter()
+            .enumerate()
+            .filter_map(|(index, channel)| {
+                let invalid = missed_display_blocks
+                    || b.flags.contains(&SignalFlag::Disconnected)
+                    || b.sample_metadata.get(index).is_some_and(|samples| {
+                        samples.iter().any(|sample| {
+                            !sample.sample_valid
+                                || self
+                                    .spectrum
+                                    .as_ref()
+                                    .and_then(|spectrum| {
+                                        spectrum.channels.iter().find(|s| s.channel == channel.id)
+                                    })
+                                    .is_some_and(|spectrum| {
+                                        spectrum.segment_id != sample.segment_id
+                                    })
+                        })
+                    });
+                invalid.then_some(channel.id.as_str())
+            })
+            .collect();
+        if let Some(spectrum) = &mut self.spectrum {
+            spectrum
+                .channels
+                .retain(|channel| !invalidated.contains(&channel.channel.as_str()));
         }
+        self.bands
+            .retain(|band| !invalidated.contains(&band.channel.as_str()));
         for (i, c) in b.raw_channels.iter().enumerate() {
             if let Some(history) = self.history.get_mut(i) {
                 let broken = self
@@ -193,11 +213,24 @@ impl View {
         }
         self.band_history
             .accept(&b, self.settings.spectral.history_seconds);
-        if let Some(s) = &b.spectrum {
-            self.spectrum = Some(s.clone());
+        if let Some(incoming) = &b.spectrum {
+            if let Some(cached) = &mut self.spectrum {
+                cached.timestamp_ns = incoming.timestamp_ns;
+                cached.frequencies.clone_from(&incoming.frequencies);
+                for channel in &incoming.channels {
+                    cached.channels.retain(|old| old.channel != channel.channel);
+                    cached.channels.push(channel.clone());
+                }
+            } else {
+                self.spectrum = Some(incoming.clone());
+            }
         }
-        if let Some(p) = &b.band_power {
-            self.bands = p.clone();
+        if let Some(powers) = &b.band_power {
+            for power in powers {
+                self.bands
+                    .retain(|old| old.channel != power.channel || old.band != power.band);
+                self.bands.push(power.clone());
+            }
         }
         if b.flags.contains(&SignalFlag::ChannelMismatch) {
             for band in &mut self.bands {
@@ -725,6 +758,162 @@ mod tests {
             },
         )
     }
+    fn spectral_block(
+        sequence: u64,
+        ready: [bool; 2],
+        warming: [bool; 2],
+    ) -> Arc<ProcessedSignalBlock> {
+        let timestamp_ns = sequence * 4_000_000;
+        let ids = ["A0", "A2"];
+        let spectra = ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| ready[*i])
+            .map(|(_, id)| ChannelSpectrum {
+                channel: (*id).into(),
+                timestamp_ns,
+                raw_psd: vec![0.0, 1.0],
+                filtered_psd: vec![0.0, 0.5],
+                mains_ratio: 0.0,
+                segment_id: 0,
+                sample_count: 500,
+                frequency_resolution_hz: 10.0,
+                window_function: WindowFunction::HannSymmetric,
+            })
+            .collect::<Vec<_>>();
+        Arc::new(ProcessedSignalBlock {
+            sequence,
+            started_at: timestamp_ns,
+            sample_rate_hz: 250.0,
+            raw_channels: ids
+                .iter()
+                .map(|id| ChannelSamples {
+                    id: (*id).into(),
+                    device: "fixture".into(),
+                    samples: vec![Sample {
+                        sequence,
+                        timestamp_ns,
+                        value: 1.0,
+                        flags: vec![],
+                    }],
+                })
+                .collect(),
+            filtered_channels: ids
+                .iter()
+                .map(|id| FilteredChannel {
+                    id: (*id).into(),
+                    samples: vec![Some(1.0)],
+                })
+                .collect(),
+            sample_metadata: warming
+                .iter()
+                .map(|warm| {
+                    vec![ProcessedSampleMetadata {
+                        segment_id: 0,
+                        sample_valid: !warm,
+                        filter_warmup: *warm,
+                        artifact_rejected: false,
+                        flags: if *warm {
+                            vec![SignalFlag::FilterWarmup]
+                        } else {
+                            vec![]
+                        },
+                    }]
+                })
+                .collect(),
+            channel_quality: vec![SignalQuality::Unknown; 2],
+            spectrum: (!spectra.is_empty()).then_some(SpectrumSnapshot {
+                timestamp_ns,
+                frequencies: vec![0.0, 10.0],
+                channels: spectra,
+            }),
+            band_power: Some(
+                ids.iter()
+                    .enumerate()
+                    .filter(|(i, _)| ready[*i])
+                    .map(|(_, id)| BandPower {
+                        channel: (*id).into(),
+                        band: "Theta".into(),
+                        absolute: 1.0,
+                        relative: 0.5,
+                        smoothed: 1.0,
+                        baseline_change_pct: None,
+                        asymmetry: None,
+                        segment_id: 0,
+                        quality_status: SignalQuality::Good,
+                    })
+                    .collect(),
+            ),
+            flags: if ready.iter().all(|ready| !ready) {
+                vec![SignalFlag::InsufficientData]
+            } else {
+                vec![]
+            },
+            lost_samples: 0,
+            invalid_samples: 0,
+            outliers: 0,
+            skew_ms: None,
+        })
+    }
+
+    #[test]
+    fn spectrum_panels_keep_positions_through_warmup_partial_frames_and_recovery() {
+        use ratatui::backend::TestBackend;
+        let config = Config::default();
+        for (width, height) in [(120, 36), (60, 20)] {
+            let mut v = view();
+            v.page = 2;
+            let render = |v: &View| {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, height)).expect("terminal");
+                terminal
+                    .draw(|frame| {
+                        render::draw(frame, &config, &[], v, &RuntimeStatus::default(), 0)
+                    })
+                    .expect("draw");
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .chunks(width as usize)
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+            };
+            v.accept(spectral_block(0, [true, true], [false, false]));
+            let before = render(&v);
+            let positions = ["A0 |", "A2 |"].map(|title| {
+                before
+                    .iter()
+                    .position(|line| line.contains(title))
+                    .expect("panel")
+            });
+            v.accept(spectral_block(1, [false, true], [true, false]));
+            let waiting = render(&v);
+            assert!(waiting[positions[0]].contains("A0 | Filter warmup"));
+            assert!(waiting[positions[1]].contains("A2 | peak"));
+            assert!(!v.bands.iter().any(|band| band.channel == "A0"));
+            // Ordinary blocks between FFT hops must not erase the ready channel.
+            v.accept(spectral_block(2, [false, false], [true, false]));
+            assert!(render(&v)[positions[1]].contains("A2 | peak"));
+            v.accept(spectral_block(3, [true, false], [false, false]));
+            let recovered = render(&v);
+            for (index, id) in ["A0", "A2"].iter().enumerate() {
+                assert!(recovered[positions[index]].contains(&format!("{id} | peak")));
+            }
+            // Cached FFT arrival order must not change channel selection.
+            v.settings.waveform.channels = 2;
+            let selected = render(&v).join("\n");
+            assert!(selected.contains("A2 | peak"));
+            assert!(!selected.contains("A0 | peak"));
+            v.settings.waveform.channels = 0;
+            v.accept(spectral_block(4, [false, false], [true, true]));
+            let reset = render(&v);
+            assert!(reset[positions[0]].contains("A0 | Filter warmup"));
+            assert!(reset[positions[1]].contains("A2 | Filter warmup"));
+            assert!(v.bands.is_empty());
+        }
+    }
+
     #[test]
     fn storage_reset_restores_experiment_defaults_and_respects_cli_directory() {
         let mut v = view();

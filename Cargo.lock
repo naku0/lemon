@@ -688,11 +688,14 @@ dependencies = [
 name = "mu-condition-analysis"
 version = "0.2.0"
 dependencies = [
+ "analysis",
+ "core",
  "csv",
  "lemon-plugin-sdk",
- "rustfft",
+ "processing",
  "serde",
  "serde_json",
+ "storage",
 ]
 
 [[package]]
