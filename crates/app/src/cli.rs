@@ -18,7 +18,7 @@ use tui::settings::Settings;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Action>,
-    /// Конфигурация эксперимента (выше LEMON_CONFIG)
+    /// Конфигурация эксперимента; для `plugin run` — JSON-конфигурация плагина
     #[arg(short = 'f', long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
     /// Количество каналов: 1 или 2
@@ -154,12 +154,54 @@ pub enum Action {
         #[command(flatten)]
         options: ImportArgs,
     },
+    /// Manage locally registered analysis plugins
+    Plugins {
+        #[command(subcommand)]
+        command: PluginsAction,
+    },
+    /// Run an analysis plugin in a separate process
+    Plugin {
+        #[command(subcommand)]
+        command: PluginAction,
+    },
     /// Перечислить доступные последовательные порты
     Ports,
     /// Создать или проверить конфигурацию
     Config {
         #[command(subcommand)]
         command: ConfigAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginsAction {
+    /// Validate and register a local plugin directory without running it
+    Add { plugin_dir: PathBuf },
+    /// List registered plugins and their current status
+    List,
+    /// Show the current manifest and status for an ID or directory
+    Inspect { plugin_id_or_dir: String },
+    /// Remove an ID from the registry without deleting plugin files
+    Remove { plugin_id: String },
+    /// Enable a registered plugin
+    Enable { plugin_id: String },
+    /// Disable a registered plugin
+    Disable { plugin_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginAction {
+    /// Run a plugin against an existing AnalysisBundle
+    Run {
+        plugin_id_or_dir: String,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long, default_value_t = 300, value_parser=clap::value_parser!(u64).range(1..=86400))]
+        timeout: u64,
     },
 }
 #[derive(Debug, Clone, Default, Args)]
@@ -497,4 +539,45 @@ pub enum ReportAction {
     },
     /// Diagnose the managed Python environment without installing packages
     Doctor,
+}
+
+#[cfg(test)]
+mod plugin_cli_tests {
+    use super::*;
+    #[test]
+    fn parses_registry_commands() {
+        for args in [
+            vec!["lemon", "plugins", "add", "./plugin"],
+            vec!["lemon", "plugins", "list"],
+            vec!["lemon", "plugins", "inspect", "example-summary"],
+            vec!["lemon", "plugins", "disable", "example-summary"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+    }
+    #[test]
+    fn parses_plugin_run_contract() {
+        let cli = Cli::try_parse_from([
+            "lemon",
+            "plugin",
+            "run",
+            "example-summary",
+            "--input",
+            "analysis",
+            "--config",
+            "plugin-config.json",
+            "--output",
+            "result",
+            "--timeout",
+            "7",
+        ])
+        .expect("CLI");
+        assert_eq!(cli.config, Some(PathBuf::from("plugin-config.json")));
+        assert!(matches!(
+            cli.command,
+            Some(Action::Plugin {
+                command: PluginAction::Run { timeout: 7, .. }
+            })
+        ));
+    }
 }

@@ -33,6 +33,7 @@ pub struct UiOptions {
     pub data_directory_locked: bool,
     pub experiment_directory: String,
     pub experiment_session_name: String,
+    pub plugin_registry_path: PathBuf,
 }
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -49,6 +50,7 @@ enum EditTarget {
     Setting(Field),
     Session(usize),
     Marker,
+    PluginPath,
 }
 #[derive(Clone)]
 enum Overlay {
@@ -58,6 +60,7 @@ enum Overlay {
     Edit(EditTarget, String),
     Summary(RecordingSummary),
     Details(Field),
+    PluginDetails,
 }
 struct View {
     page: usize,
@@ -83,9 +86,26 @@ struct View {
     seen_summary: Option<(String, u64)>,
     last_event: Option<(u64, String, String)>,
     source_finished_seen: bool,
+    plugins: Vec<plugins::PluginInfo>,
+    plugin_registry_path: PathBuf,
+    plugin_selection: usize,
 }
 impl View {
     fn new(config: &Config, options: UiOptions) -> Self {
+        let plugin_registry_path = options.plugin_registry_path.clone();
+        let (plugins, registry_error) = match plugins::Platform::open(&plugin_registry_path) {
+            Ok(platform) => (platform.list(), None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let unavailable = plugins
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.state,
+                    plugins::PluginState::Unavailable | plugins::PluginState::Incompatible
+                )
+            })
+            .count();
         Self {
             page: options.settings.general.start_tab,
             paused: false,
@@ -104,7 +124,13 @@ impl View {
             spectrum: None,
             bands: Vec::new(),
             overlay: None,
-            message: String::new(),
+            message: if let Some(error) = registry_error {
+                format!("Plugin registry unavailable: {error}")
+            } else if unavailable == 0 {
+                String::new()
+            } else {
+                format!("{unavailable} connected plugin(s) unavailable. See Plugins.")
+            },
             selection: 0,
             session_selection: 0,
             session: config.session.clone(),
@@ -116,6 +142,9 @@ impl View {
             seen_summary: None,
             last_event: None,
             source_finished_seen: false,
+            plugins,
+            plugin_registry_path,
+            plugin_selection: 0,
         }
     }
     fn accept(&mut self, b: Arc<ProcessedSignalBlock>) {
@@ -307,6 +336,14 @@ impl View {
                 self.send(tx, Command::Marker(text));
                 self.message = "Saving marker...".into();
             }
+            EditTarget::PluginPath => {
+                let mut platform = plugins::Platform::open(&self.plugin_registry_path)
+                    .map_err(|e| e.to_string())?;
+                platform.add(text.trim()).map_err(|e| e.to_string())?;
+                self.plugins = platform.list();
+                self.plugin_selection = self.plugins.len().saturating_sub(1);
+                self.message = "Plugin registered; no code was run".into();
+            }
             EditTarget::Session(index) => {
                 if status.recording_active || self.record_requested {
                     return Err("Session fields are locked while recording".into());
@@ -346,6 +383,11 @@ impl View {
                 Overlay::Details(field) => {
                     if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                         self.overlay = Some(Overlay::Details(field));
+                    }
+                }
+                Overlay::PluginDetails => {
+                    if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                        self.overlay = Some(Overlay::PluginDetails);
                     }
                 }
                 Overlay::Help => {
@@ -440,6 +482,28 @@ impl View {
             }
             return false;
         }
+        if self.page == 6 {
+            match key.code {
+                KeyCode::Up => self.plugin_selection = self.plugin_selection.saturating_sub(1),
+                KeyCode::Down => {
+                    self.plugin_selection =
+                        (self.plugin_selection + 1).min(self.plugins.len().saturating_sub(1))
+                }
+                KeyCode::Char('r' | 'R') => self.refresh_plugins(),
+                KeyCode::Char('a' | 'A') => {
+                    self.overlay = Some(Overlay::Edit(EditTarget::PluginPath, String::new()))
+                }
+                KeyCode::Enter => {
+                    if !self.plugins.is_empty() {
+                        self.overlay = Some(Overlay::PluginDetails);
+                    }
+                }
+                KeyCode::Char(' ') => self.toggle_plugin(),
+                KeyCode::Char('x' | 'X') => self.remove_plugin(),
+                _ => return self.global_key(key, status, tx, config),
+            }
+            return false;
+        }
         if self.page == 4 {
             match key.code {
                 KeyCode::Up => {
@@ -476,9 +540,9 @@ impl View {
         match key.code {
             KeyCode::Char('q' | 'Q') | KeyCode::Esc => return self.request_quit(status),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
-            KeyCode::Tab => self.page = (self.page + 1) % 6,
-            KeyCode::BackTab => self.page = (self.page + 5) % 6,
-            KeyCode::Char(c @ '1'..='6') => self.page = c as usize - '1' as usize,
+            KeyCode::Tab => self.page = (self.page + 1) % 7,
+            KeyCode::BackTab => self.page = (self.page + 6) % 7,
+            KeyCode::Char(c @ '1'..='7') => self.page = c as usize - '1' as usize,
             KeyCode::Char('r' | 'R') => self.recording(tx, status),
             KeyCode::Char('m' | 'M') => {
                 if status.recording_active {
@@ -535,6 +599,44 @@ impl View {
             _ => {}
         }
         false
+    }
+    fn refresh_plugins(&mut self) {
+        match plugins::Platform::open(&self.plugin_registry_path) {
+            Ok(platform) => {
+                self.plugins = platform.list();
+                self.plugin_selection = self
+                    .plugin_selection
+                    .min(self.plugins.len().saturating_sub(1));
+                self.message = "Plugin statuses refreshed; no code was run".into();
+            }
+            Err(e) => self.message = e.to_string(),
+        }
+    }
+    fn toggle_plugin(&mut self) {
+        let Some(item) = self.plugins.get(self.plugin_selection) else {
+            return;
+        };
+        let id = item.id.clone();
+        let enabled = !item.enabled;
+        match plugins::Platform::open(&self.plugin_registry_path)
+            .and_then(|mut p| p.set_enabled(&id, enabled))
+        {
+            Ok(_) => self.refresh_plugins(),
+            Err(e) => self.message = e.to_string(),
+        }
+    }
+    fn remove_plugin(&mut self) {
+        let Some(item) = self.plugins.get(self.plugin_selection) else {
+            return;
+        };
+        let id = item.id.clone();
+        match plugins::Platform::open(&self.plugin_registry_path).and_then(|mut p| p.remove(&id)) {
+            Ok(()) => {
+                self.refresh_plugins();
+                self.message = format!("Removed {id} from registry; files were not deleted");
+            }
+            Err(e) => self.message = e.to_string(),
+        }
     }
 }
 
@@ -619,6 +721,7 @@ mod tests {
                 data_directory_locked: false,
                 experiment_directory: Config::default().recording_dir,
                 experiment_session_name: Config::default().session.name,
+                plugin_registry_path: PathBuf::from("unused-plugins.json"),
             },
         )
     }
@@ -712,6 +815,30 @@ mod tests {
             f.adjust(&mut s, 1);
         }
         assert_eq!(s, before);
+    }
+    #[test]
+    fn plugins_screen_keeps_unavailable_entries_nonfatal() {
+        let root = std::env::temp_dir().join(format!("lemon-tui-plugins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp");
+        let registry = root.join("plugins.json");
+        std::fs::write(&registry,format!(r#"{{"schema_version":1,"plugins":[{{"id":"missing","path":"{}","enabled":true}}]}}"#,root.join("missing").display())).expect("registry");
+        let v = View::new(
+            &Config::default(),
+            UiOptions {
+                settings: Settings::default(),
+                settings_path: root.join("settings.json"),
+                interrupt: Arc::new(AtomicBool::new(false)),
+                data_directory_locked: false,
+                experiment_directory: "recordings".into(),
+                experiment_session_name: "session".into(),
+                plugin_registry_path: registry,
+            },
+        );
+        assert_eq!(v.plugins.len(), 1);
+        assert_eq!(v.plugins[0].state, plugins::PluginState::Unavailable);
+        assert!(v.message.contains("unavailable"));
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn settings_categories_keep_fields_accessible_and_lock_acquisition() {

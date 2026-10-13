@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "plugins/mu-condition-analysis"]
 resolver = "2"
 
 [workspace.package]
@@ -25,6 +25,8 @@ storage = { path = "crates/storage" }
 tui = { path = "crates/tui" }
 analysis = { path = "crates/analysis" }
 report = { path = "crates/report" }
+plugins = { path = "crates/plugins" }
+lemon-plugin-sdk = { path = "crates/lemon-plugin-sdk" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

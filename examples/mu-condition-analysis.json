@@ -1,0 +1,23 @@
+{
+  "mode": "condition-comparison",
+  "channels": ["A0", "A2"],
+  "bands": {
+    "mu_hz": [8.0, 13.0],
+    "beta_hz": [13.0, 30.0]
+  },
+  "window_seconds": 2.0,
+  "hop_seconds": 0.5,
+  "baseline": {
+    "label": "background"
+  },
+  "conditions": [
+    {
+      "label": "right-hand-squeeze",
+      "analysis_bundle": "../reports/lab2/right-hand-squeeze-analysis"
+    },
+    {
+      "label": "imagined-squeeze",
+      "analysis_bundle": "../reports/lab2/imagined-squeeze-analysis"
+    }
+  ]
+}

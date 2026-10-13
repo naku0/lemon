@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "mu-condition-analysis",
+  "display_name": "Mu-band condition comparison",
+  "version": "0.2.0",
+  "api_version": 1,
+  "description": "Descriptive Mu and Beta band-power comparison between a background recording and separate condition recordings.",
+  "entrypoint": {
+    "program": "target/release/mu-condition-analysis",
+    "args": []
+  }
+}
