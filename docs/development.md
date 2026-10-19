@@ -47,6 +47,20 @@ lemon --version
 `report_support.rs` и `logging.rs`. Бизнес-правила должны оставаться в своих crates:
 CLI-модули только переводят аргументы пользователя в их публичные интерфейсы.
 
+Внутри DSP и анализа основные границы проходят так:
+
+| Модуль | Ответственность |
+|---|---|
+| `crates/processing/src/lib.rs` | Потоковый causal processor и состояние каналов |
+| `crates/processing/src/spectrum.rs` | Общие PSD и интегрирование мощности диапазона |
+| `crates/processing/src/windows.rs` | Единая сетка окон и причины их исключения |
+| `crates/analysis/src/lib.rs` | Оркестрация анализа Raw-записи |
+| `crates/analysis/src/bundle.rs` | Публичный контракт чтения и проверки AnalysisBundle |
+| `crates/analysis/src/output.rs` | Staging, overwrite и атомарная публикация bundle |
+
+Плагины должны использовать публичные функции `processing` и читатели SDK. Не
+переносите в них копии PSD, правил формирования окон или проверки AnalysisBundle.
+
 Для поиска причины ошибки двигайтесь по потоку данных:
 
 ```text

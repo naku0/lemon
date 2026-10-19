@@ -5,7 +5,7 @@ use processing::{
     windows::{AnalysisSample, WindowCandidate, WindowGenerator, WindowingConfig},
     Processor,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File},
@@ -15,6 +15,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use storage::{external, Metadata, SessionReader};
+
+mod bundle;
+mod output;
+
+pub use bundle::{AnalysisBundle, BandSummary, ChannelSummary, QualityCount, Summary};
+use output::OutputTransaction;
 
 pub type AnalysisError = String;
 #[derive(Debug, Clone)]
@@ -29,88 +35,6 @@ pub struct AnalysisOptions {
     pub units: Option<String>,
     pub overwrite: bool,
     pub import: external::Options,
-}
-#[derive(Debug, Clone)]
-pub struct AnalysisBundle {
-    pub directory: PathBuf,
-    pub summary: Summary,
-}
-impl AnalysisBundle {
-    pub fn open(directory: impl Into<PathBuf>) -> Result<Self, AnalysisError> {
-        let directory = directory.into();
-        for name in ["manifest.json", "summary.json"] {
-            let path = directory.join(name);
-            if fs::metadata(&path)
-                .map_err(|e| format!("analysis/open {}: {e}", path.display()))?
-                .len()
-                > 4 * 1024 * 1024
-            {
-                return Err(format!(
-                    "analysis/open {}: JSON exceeds 4 MiB",
-                    path.display()
-                ));
-            }
-        }
-        let manifest: serde_json::Value = serde_json::from_reader(
-            File::open(directory.join("manifest.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let format_version = manifest["analysis_format_version"]
-            .as_u64()
-            .ok_or("analysis/open: missing or invalid analysis_format_version")?;
-        if !matches!(format_version, 1 | 2) {
-            return Err("analysis/open: unsupported analysis_format_version".into());
-        }
-        if format_version == 2
-            && (!matches!(manifest["dsp_algorithm_version"].as_u64(), Some(2 | 3))
-                || manifest["psd_algorithm_version"].as_u64() != Some(2)
-                || manifest["processing_mode"].as_str() != Some("causal_live_compatible")
-                || manifest["window_function"].as_str() != Some("hann_symmetric"))
-        {
-            return Err("analysis/open: missing or unsupported v2 DSP provenance".into());
-        }
-        if manifest["dsp_algorithm_version"].as_u64() == Some(3)
-            && manifest["windowing_algorithm_version"].as_u64() != Some(1)
-        {
-            return Err("analysis/open: missing or unsupported windowing_algorithm_version".into());
-        }
-        let summary: Summary = serde_json::from_reader(
-            File::open(directory.join("summary.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        for name in [
-            "manifest.json",
-            "processed.csv",
-            "spectrum.csv",
-            "band-power.csv",
-            "quality-events.csv",
-        ] {
-            if !directory.join(name).is_file() {
-                return Err(format!("analysis: missing {name}"));
-            }
-        }
-        if format_version >= 2 && !directory.join("excluded-windows.csv").is_file() {
-            return Err("analysis: missing excluded-windows.csv".into());
-        }
-        if format_version == 2 {
-            for (name, required) in [
-                ("processed.csv", "timestamp_ns,sequence,channel,raw,filtered,segment_id,sample_valid,filter_warmup,artifact_rejected,quality,flags"),
-                ("spectrum.csv", "window_index,window_start_ns,window_end_ns,channel,segment_id,frequency_hz,raw_psd,filtered_psd,window_function,sample_count,frequency_resolution_hz"),
-                ("band-power.csv", "window_index,window_start_ns,window_end_ns,channel,segment_id,band,low_hz,high_hz,absolute,relative,smoothed,baseline_change_pct,quality_status"),
-                ("excluded-windows.csv", "channel,segment_id,window_index,window_start_ns,window_end_ns,reason_codes,details"),
-            ] {
-                let file = File::open(directory.join(name)).map_err(|error| format!("analysis/open {name}: {error}"))?;
-                let mut csv = csv::Reader::from_reader(file.take(65536));
-                let headers = csv.headers().map_err(|error| format!("analysis/open {name}: {error}"))?;
-                for field in required.split(',') {
-                    if headers.iter().filter(|header| *header == field).count() != 1 {
-                        return Err(format!("analysis/open {name}: v2 requires exactly one {field} column"));
-                    }
-                }
-            }
-        }
-        Ok(Self { directory, summary })
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +76,7 @@ struct Manifest {
     reject_low_quality_windows: bool,
     window_exclusion_flags: Vec<String>,
 }
+
 #[derive(Debug, Serialize)]
 struct SpectralConfig {
     window_samples: usize,
@@ -159,68 +84,6 @@ struct SpectralConfig {
     window: String,
     aggregation: String,
 }
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct QualityCount {
-    pub count: u64,
-    pub fraction: f64,
-}
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BandSummary {
-    pub low_hz: f64,
-    pub high_hz: f64,
-    pub mean_absolute_power: f64,
-    pub median_absolute_power: Option<f64>,
-    pub mean_relative_power: f64,
-    pub median_relative_power: Option<f64>,
-    pub min_relative_power: f64,
-    pub max_relative_power: f64,
-    pub mean_baseline_change_pct: Option<f64>,
-    pub valid_window_count: u64,
-}
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ChannelSummary {
-    pub raw_min: f64,
-    pub raw_max: f64,
-    pub raw_mean: f64,
-    pub raw_stddev: f64,
-    pub filtered_min: Option<f64>,
-    pub filtered_max: Option<f64>,
-    pub filtered_mean: Option<f64>,
-    pub filtered_stddev: Option<f64>,
-    pub quality_distribution: BTreeMap<String, QualityCount>,
-    pub dominant_peak_frequency_hz: Option<f64>,
-    pub dominant_peak_power: Option<f64>,
-    pub mains_power_before: f64,
-    pub mains_power_after: f64,
-    pub mains_reduction_percent: Option<f64>,
-    pub band_statistics: BTreeMap<String, BandSummary>,
-}
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Summary {
-    pub duration_seconds: f64,
-    pub channel_count: usize,
-    pub sample_count_by_channel: BTreeMap<String, u64>,
-    pub valid_filtered_count_by_channel: BTreeMap<String, u64>,
-    pub missing_count_by_channel: BTreeMap<String, u64>,
-    pub lost_sample_count: u64,
-    pub invalid_packet_count: u64,
-    pub outlier_count: u64,
-    pub saturation_count: u64,
-    pub disconnection_count: u64,
-    pub continuous_segment_count: u64,
-    pub sample_rate_hz: f64,
-    pub sample_rate_source: String,
-    pub channels: BTreeMap<String, ChannelSummary>,
-    pub warnings: Vec<String>,
-    pub dominant_band_by_channel: BTreeMap<String, String>,
-    #[serde(default)]
-    pub valid_spectral_window_count_by_channel: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub excluded_spectral_window_count_by_channel: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub excluded_window_reasons: BTreeMap<String, u64>,
-}
-
 #[derive(Default, Clone)]
 struct Running {
     n: u64,
@@ -630,10 +493,8 @@ pub fn analyze(
     config
         .validate()
         .map_err(|e| format!("analyze/DSP {}: {e}", input.path.display()))?;
-    let output = make_output(&input.path, &options, &meta)?;
-    validate_output(&input.path, &output, options.overwrite)?;
-    let staging = Staging::new(&output)?;
-    let temp = &staging.0;
+    let output = OutputTransaction::new(&input.path, &options, &meta)?;
+    let temp = output.staging_directory();
     let experiment_sidecar = input.path.join("experiment.json");
     let has_experiment = experiment_sidecar.is_file();
     if has_experiment {
@@ -1099,130 +960,8 @@ pub fn analyze(
     .map_err(|e| e.to_string())?;
     fs::write(temp.join("summary.md"), summary_markdown(&md, &summary))
         .map_err(|e| e.to_string())?;
-    let backup = staging.0.with_extension("previous");
-    let replacing = output.exists();
-    if replacing {
-        validate_output(&input.path, &output, options.overwrite)?;
-        if backup.exists() {
-            return Err("analyze/output: backup path already exists".into());
-        }
-        fs::rename(&output, &backup).map_err(|e| format!("analyze/output backup: {e}"))?;
-    }
-    if let Err(e) = fs::rename(temp, &output) {
-        if replacing {
-            fs::rename(&backup, &output).map_err(|restore| {
-                format!(
-                    "analyze/output: {e}; previous report retained at {}: {restore}",
-                    backup.display()
-                )
-            })?;
-        }
-        return Err(format!("analyze/output publish: {e}"));
-    }
-    if replacing {
-        fs::remove_dir_all(backup).map_err(|e| format!("analyze/output backup cleanup: {e}"))?;
-    }
-    Ok(AnalysisBundle {
-        directory: output,
-        summary,
-    })
-}
-// Only a complete, recognizable bundle may be replaced. Never remove an input/ancestor.
-fn validate_output(input: &Path, output: &Path, overwrite: bool) -> Result<(), String> {
-    if !output.exists() {
-        return Ok(());
-    }
-    let target = output.canonicalize().map_err(|e| e.to_string())?;
-    let input = input.canonicalize().map_err(|e| e.to_string())?;
-    if input.starts_with(&target) || target.starts_with(&input) {
-        return Err("analyze/output: output overlaps input; choose a separate directory".into());
-    }
-    if !overwrite {
-        return Err(
-            "analyze/output: directory exists; choose another path or use --overwrite".into(),
-        );
-    }
-    let allowed = [
-        "manifest.json",
-        "summary.json",
-        "summary.md",
-        "processed.csv",
-        "spectrum.csv",
-        "band-power.csv",
-        "quality-events.csv",
-        "excluded-windows.csv",
-        "experiment.json",
-    ];
-    if !target.join("manifest.json").is_file() || !target.join("summary.json").is_file() {
-        return Err("analyze/output: --overwrite requires an existing AnalysisBundle".into());
-    }
-    for entry in fs::read_dir(&target).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if !entry.file_type().map_err(|e| e.to_string())?.is_file()
-            || !allowed.contains(&entry.file_name().to_string_lossy().as_ref())
-        {
-            return Err("analyze/output: refusing to overwrite unrelated files".into());
-        }
-    }
-    Ok(())
-}
-struct Staging(PathBuf);
-impl Staging {
-    fn new(output: &Path) -> Result<Self, String> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let parent = output
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        for _ in 0..1000 {
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = parent.join(format!(
-                ".lemon-analysis-{}-{n}.partial",
-                std::process::id()
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        Err("analyze/output: cannot allocate staging directory".into())
-    }
-}
-impl Drop for Staging {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-fn make_output(
-    _input: &Path,
-    o: &AnalysisOptions,
-    meta: &Metadata,
-) -> Result<PathBuf, AnalysisError> {
-    if let Some(p) = &o.output {
-        if let Some(parent) = p.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("analyze/output {}: {e}", parent.display()))?;
-        }
-        return Ok(p.clone());
-    }
-    let parent = Path::new(&meta.config.recording_dir);
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    for n in 0..1000 {
-        let p = parent.join(format!(
-            "analysis-{}-{}",
-            meta.config
-                .session
-                .name
-                .replace(|c: char| !c.is_ascii_alphanumeric(), "_"),
-            n
-        ));
-        if !p.exists() {
-            return Ok(p);
-        }
-    }
-    Err("analyze/output: cannot create unique directory".into())
+    let directory = output.commit()?;
+    Ok(AnalysisBundle { directory, summary })
 }
 #[allow(clippy::too_many_arguments)]
 fn build_summary(
