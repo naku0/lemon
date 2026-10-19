@@ -1,0 +1,38 @@
+{
+  "mode": "event-locked",
+  "channels": [
+    "A0",
+    "A2"
+  ],
+  "conditions": [
+    "right-hand-squeeze",
+    "imagined-right-hand-squeeze"
+  ],
+  "anchor_event": "TaskStart",
+  "epoch_seconds": [
+    -4.0,
+    4.0
+  ],
+  "baseline_seconds": [
+    -4.0,
+    -1.0
+  ],
+  "analysis_seconds": [
+    0.0,
+    4.0
+  ],
+  "bands": {
+    "mu_hz": [
+      8.0,
+      13.0
+    ],
+    "beta_hz": [
+      13.0,
+      30.0
+    ]
+  },
+  "window_seconds": 2.0,
+  "hop_seconds": 0.5,
+  "minimum_baseline_windows": 2,
+  "minimum_analysis_windows": 2
+}

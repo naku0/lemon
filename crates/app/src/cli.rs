@@ -12,13 +12,13 @@ use tui::settings::Settings;
     version,
     propagate_version = true,
     about = "LEMON — Lightweight EEG Monitoring Of Neuroactivity",
-    long_about = "LEMON — Lightweight EEG Monitoring Of Neuroactivity\nЛокальный мониторинг, предварительная обработка и запись ЭЭГ. Без подкоманды: demo.",
-    after_help = "Примеры:\n  lemon demo -n 2 -r\n  lemon live --port /dev/cu.usbmodem123 --baud 115200\n  lemon replay recordings/session --speed 2\n  lemon report recordings/session --no-execute\n  lemon config init\n  lemon demo --headless -t 10 -r\n\nОкружение: LEMON_CONFIG, LEMON_DATA_DIR, LEMON_LOG. Справка TUI: ?"
+    long_about = "LEMON — локальная запись, воспроизведение и технический анализ ЭЭГ.\n\n`lemon run …` запускает рабочий режим. `lemon plugins …` управляет реестром плагинов, `lemon config …` — настройками. `import`, `export`, `ports` и `probe` — отдельные служебные утилиты.",
+    after_help = "Примеры:\n  lemon run demo --record\n  lemon run live --port /dev/cu.usbmodem123 --baud 115200\n  lemon run replay recordings/session --speed 2\n  lemon run analyze recording.dmov --output reports/analysis\n  lemon run study --manifest study.json --output reports/study\n  lemon run report create reports/analysis --no-execute\n  lemon config init\n\nОкружение: LEMON_CONFIG, LEMON_DATA_DIR, LEMON_LOG. Справка TUI: ?"
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Action>,
-    /// Конфигурация эксперимента; для `plugin run` — JSON-конфигурация плагина
+    /// Конфигурация обработки; для `run plugin` — JSON-конфигурация плагина
     #[arg(short = 'f', long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
     /// Количество каналов: 1 или 2
@@ -48,9 +48,16 @@ pub struct Cli {
 }
 #[derive(Debug, Subcommand)]
 pub enum Action {
+    /// Запустить live, demo, replay, анализ, study, эксперимент, плагин или отчёт
+    Run {
+        #[command(subcommand)]
+        command: RunAction,
+    },
     /// Воспроизводимый синтетический сигнал без оборудования
+    #[command(hide = true)]
     Demo,
     /// Последовательный порт с протоколом csv или tagged-u8
+    #[command(hide = true)]
     Live {
         /// Один порт с 1/2 каналами или два порта по одному каналу
         #[arg(long, value_name = "PORT")]
@@ -85,6 +92,7 @@ pub enum Action {
         max_bytes: u64,
     },
     /// Воспроизвести сеанс LEMON, CSV, DAT, DMOV или каталог BiTronics
+    #[command(hide = true)]
     Replay {
         #[arg(value_name = "INPUT")]
         directory: PathBuf,
@@ -112,6 +120,7 @@ pub enum Action {
         output: PathBuf,
     },
     /// Построить потоковый технический пакет анализа без TUI
+    #[command(hide = true)]
     Analyze {
         input: PathBuf,
         #[arg(short, long)]
@@ -122,7 +131,7 @@ pub enum Action {
         options: ImportArgs,
     },
     /// Создать воспроизводимый Jupyter Notebook из AnalysisBundle
-    #[command(args_conflicts_with_subcommands = true)]
+    #[command(args_conflicts_with_subcommands = true, hide = true)]
     Report {
         #[command(subcommand)]
         command: Option<ReportAction>,
@@ -154,15 +163,22 @@ pub enum Action {
         #[command(flatten)]
         options: ImportArgs,
     },
-    /// Manage locally registered analysis plugins
+    /// Управлять реестром локальных аналитических плагинов
     Plugins {
         #[command(subcommand)]
         command: PluginsAction,
     },
-    /// Run an analysis plugin in a separate process
+    /// Выполнить аналитический плагин в отдельном процессе
+    #[command(hide = true)]
     Plugin {
         #[command(subcommand)]
         command: PluginAction,
+    },
+    /// Выполнить протокол записи со структурированными markers
+    #[command(hide = true)]
+    Experiment {
+        #[command(subcommand)]
+        command: ExperimentAction,
     },
     /// Перечислить доступные последовательные порты
     Ports,
@@ -173,19 +189,332 @@ pub enum Action {
     },
 }
 
+/// Рабочие режимы LEMON.
+#[derive(Debug, Subcommand)]
+pub enum RunAction {
+    /// Принимать EEG из последовательного порта
+    Live {
+        /// Один порт с 1/2 каналами или два порта по одному каналу
+        #[arg(long, value_name = "PORT")]
+        port: Vec<String>,
+        /// Скорость порта; по умолчанию из конфигурации
+        #[arg(long,value_parser=clap::value_parser!(u32).range(1..))]
+        baud: Option<u32>,
+        #[arg(long, value_parser = ["csv", "tagged-u8"])]
+        protocol: Option<String>,
+        #[arg(long)]
+        sample_rate: Option<f64>,
+        #[arg(long)]
+        units: Option<String>,
+        #[arg(long)]
+        startup_delay_ms: Option<u64>,
+    },
+    /// Запустить воспроизводимый синтетический источник
+    Demo,
+    /// Воспроизвести сеанс или внешнюю запись
+    Replay {
+        #[arg(value_name = "INPUT")]
+        directory: PathBuf,
+        #[arg(long, value_parser = speed)]
+        speed: Option<f64>,
+        #[command(flatten)]
+        import: ImportArgs,
+    },
+    /// Создать технический AnalysisBundle одной записи
+    Analyze {
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        overwrite: bool,
+        #[command(flatten)]
+        options: ImportArgs,
+    },
+    /// Пакетно подготовить AnalysisBundle для фоновой и condition-записей
+    Study {
+        /// JSON-manifest с явными ролями и относительными путями источников
+        #[arg(long, value_name = "STUDY_JSON")]
+        manifest: PathBuf,
+        /// Новый каталог study; существующий заменяется только с --overwrite
+        #[arg(long, value_name = "OUTPUT_DIR")]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Записать EEG по протоколу фаз и trials
+    Experiment {
+        #[arg(long)]
+        protocol: PathBuf,
+        #[arg(long, conflicts_with_all = ["port", "replay"])]
+        demo: bool,
+        #[arg(long, value_name = "PORT", conflicts_with = "replay")]
+        port: Vec<String>,
+        #[arg(long, value_name = "SESSION", conflicts_with_all = ["demo", "port"])]
+        replay: Option<PathBuf>,
+        #[arg(long, value_parser=clap::value_parser!(u32).range(1..))]
+        baud: Option<u32>,
+        #[arg(long, default_value_t = 1.0)]
+        time_scale: f64,
+    },
+    /// Выполнить локальный аналитический плагин
+    Plugin {
+        plugin_id_or_dir: String,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long, default_value_t = 300, value_parser=clap::value_parser!(u64).range(1..=86400))]
+        timeout: u64,
+    },
+    /// Создать отчёт или управлять его Python-окружением
+    Report {
+        #[command(subcommand)]
+        command: RunReportAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RunReportAction {
+    /// Создать local, portable или Colab notebook
+    Create {
+        #[arg(value_name = "INPUT", conflicts_with = "analysis")]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        analysis: Option<PathBuf>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long, conflicts_with = "no_execute")]
+        execute: bool,
+        #[arg(long, conflicts_with = "execute")]
+        no_execute: bool,
+        #[arg(long)]
+        python: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["colab", "open"], group = "raw_container")]
+        portable: bool,
+        #[arg(long, conflicts_with_all = ["execute", "open"], group = "raw_container")]
+        colab: bool,
+        #[arg(long, requires = "raw_container")]
+        include_raw: bool,
+        #[arg(long, default_value = "25", value_parser = clap::value_parser!(u64).range(1..=1024))]
+        maximum_embedded_report_mb: u64,
+        #[arg(long)]
+        open: bool,
+        #[arg(long)]
+        overwrite: bool,
+        #[command(flatten)]
+        options: Box<ImportArgs>,
+    },
+    /// Создать или восстановить управляемое Python-окружение
+    Setup {
+        #[arg(long)]
+        recreate: bool,
+        #[arg(long)]
+        python: Option<PathBuf>,
+    },
+    /// Проверить Python, venv, kernel и зависимости отчётов
+    Healthcheck,
+}
+
+impl Cli {
+    /// Collapse the canonical `run …` grammar into the legacy-neutral request
+    /// variants consumed by configuration resolution and command dispatch.
+    /// Legacy commands already use those variants, so both syntaxes cross the
+    /// same seam and cannot acquire different runtime behaviour.
+    pub fn normalize_run(&mut self) {
+        let command = match self.command.take() {
+            Some(Action::Run { command }) => command,
+            legacy => {
+                self.command = legacy;
+                return;
+            }
+        };
+        self.command = Some(match command {
+            RunAction::Demo => Action::Demo,
+            RunAction::Live {
+                port,
+                baud,
+                protocol,
+                sample_rate,
+                units,
+                startup_delay_ms,
+            } => Action::Live {
+                port,
+                baud,
+                protocol,
+                sample_rate,
+                units,
+                startup_delay_ms,
+            },
+            RunAction::Replay {
+                directory,
+                speed,
+                import,
+            } => Action::Replay {
+                directory,
+                speed,
+                import,
+            },
+            RunAction::Analyze {
+                input,
+                output,
+                overwrite,
+                options,
+            } => Action::Analyze {
+                input,
+                output,
+                overwrite,
+                options,
+            },
+            RunAction::Study {
+                manifest,
+                output,
+                overwrite,
+            } => Action::Run {
+                command: RunAction::Study {
+                    manifest,
+                    output,
+                    overwrite,
+                },
+            },
+            RunAction::Experiment {
+                protocol,
+                demo,
+                port,
+                replay,
+                baud,
+                time_scale,
+            } => Action::Experiment {
+                command: ExperimentAction::Run {
+                    protocol,
+                    demo,
+                    port,
+                    replay,
+                    baud,
+                    time_scale,
+                },
+            },
+            RunAction::Plugin {
+                plugin_id_or_dir,
+                input,
+                output,
+                overwrite,
+                timeout,
+            } => Action::Plugin {
+                command: PluginAction::Run {
+                    plugin_id_or_dir,
+                    input,
+                    output,
+                    overwrite,
+                    timeout,
+                },
+            },
+            RunAction::Report { command } => match command {
+                RunReportAction::Create {
+                    input,
+                    analysis,
+                    output,
+                    execute,
+                    no_execute,
+                    python,
+                    portable,
+                    colab,
+                    include_raw,
+                    maximum_embedded_report_mb,
+                    open,
+                    overwrite,
+                    options,
+                } => Action::Report {
+                    command: None,
+                    input,
+                    analysis,
+                    output,
+                    execute,
+                    no_execute,
+                    python,
+                    portable,
+                    colab,
+                    include_raw,
+                    maximum_embedded_report_mb,
+                    open,
+                    overwrite,
+                    options: *options,
+                },
+                RunReportAction::Setup { recreate, python } => Action::Report {
+                    command: Some(ReportAction::Setup { recreate, python }),
+                    input: None,
+                    analysis: None,
+                    output: None,
+                    execute: false,
+                    no_execute: false,
+                    python: None,
+                    portable: false,
+                    colab: false,
+                    include_raw: false,
+                    maximum_embedded_report_mb: 25,
+                    open: false,
+                    overwrite: false,
+                    options: ImportArgs::default(),
+                },
+                RunReportAction::Healthcheck => Action::Report {
+                    command: Some(ReportAction::Doctor),
+                    input: None,
+                    analysis: None,
+                    output: None,
+                    execute: false,
+                    no_execute: false,
+                    python: None,
+                    portable: false,
+                    colab: false,
+                    include_raw: false,
+                    maximum_embedded_report_mb: 25,
+                    open: false,
+                    overwrite: false,
+                    options: ImportArgs::default(),
+                },
+            },
+        });
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExperimentAction {
+    /// Record EEG while executing a validated phase/trial plan
+    Run {
+        #[arg(long)]
+        protocol: PathBuf,
+        /// Use the deterministic synthetic source
+        #[arg(long, conflicts_with_all = ["port", "replay"])]
+        demo: bool,
+        /// Serial port; repeat for a dual-port source
+        #[arg(long, value_name = "PORT", conflicts_with = "replay")]
+        port: Vec<String>,
+        /// Use the source timeline from an existing native LEMON session
+        #[arg(long, value_name = "SESSION", conflicts_with_all = ["demo", "port"])]
+        replay: Option<PathBuf>,
+        #[arg(long, value_parser=clap::value_parser!(u32).range(1..))]
+        baud: Option<u32>,
+        /// Test-only phase duration multiplier for demo/headless
+        #[arg(long, default_value_t = 1.0)]
+        time_scale: f64,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum PluginsAction {
-    /// Validate and register a local plugin directory without running it
+    /// Проверить и подключить локальный каталог плагина без запуска
     Add { plugin_dir: PathBuf },
-    /// List registered plugins and their current status
+    /// Показать подключённые плагины и их состояние
     List,
-    /// Show the current manifest and status for an ID or directory
+    /// Показать manifest и состояние плагина
     Inspect { plugin_id_or_dir: String },
-    /// Remove an ID from the registry without deleting plugin files
+    /// Удалить ID из реестра, сохранив файлы плагина
     Remove { plugin_id: String },
-    /// Enable a registered plugin
+    /// Включить подключённый плагин
     Enable { plugin_id: String },
-    /// Disable a registered plugin
+    /// Выключить подключённый плагин
     Disable { plugin_id: String },
 }
 
@@ -204,7 +533,7 @@ pub enum PluginAction {
         timeout: u64,
     },
 }
-#[derive(Debug, Clone, Default, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct ImportArgs {
     /// Подтверждённая номинальная частота, Hz; иначе оценка по времени
     #[arg(long, value_parser = sample_rate)]
@@ -221,6 +550,18 @@ pub struct ImportArgs {
     pub units: Option<String>,
     #[arg(long)]
     pub channel_name: Vec<String>,
+}
+impl Default for ImportArgs {
+    fn default() -> Self {
+        Self {
+            sample_rate: None,
+            time_column: None,
+            channel_column: Vec::new(),
+            delimiter: "auto".into(),
+            units: None,
+            channel_name: Vec::new(),
+        }
+    }
 }
 impl ImportArgs {
     pub fn options(&self) -> storage::external::Options {
@@ -462,6 +803,38 @@ pub fn resolve(
                 experiment.source.replay_speed = *speed;
             }
         }
+        Some(Action::Experiment {
+            command:
+                ExperimentAction::Run {
+                    demo,
+                    port,
+                    replay,
+                    baud,
+                    ..
+                },
+        }) => {
+            if *demo {
+                experiment.source.mode = "synthetic".into();
+            } else if let Some(directory) = replay {
+                let metadata = storage::read_metadata(directory)?;
+                experiment.source.mode = "replay".into();
+                experiment.source.replay_path = directory.to_string_lossy().into_owned();
+                experiment.source.channels = metadata.config.source.channels;
+                experiment.source.sample_rate_hz = metadata.config.source.sample_rate_hz;
+                experiment.source.units = metadata.units;
+            } else {
+                experiment.source.mode = "serial".into();
+                if !port.is_empty() {
+                    experiment.source.ports = port.clone();
+                }
+                if let Some(baud) = baud {
+                    experiment.source.baud_rate = *baud;
+                }
+                if experiment.source.ports.is_empty() {
+                    return Err("experiment run: provide --demo or --port PORT".into());
+                }
+            }
+        }
         _ => {}
     }
     let experiment_directory = experiment.recording_dir.clone();
@@ -509,10 +882,12 @@ pub fn legacy_hint(args: &[String]) -> Option<&'static str> {
         match arg.split('=').next().unwrap_or("") {
             "--source" => {
                 return Some(
-                    "Используйте lemon demo или lemon live --port PORT; прежний --source удалён.",
+                    "Используйте lemon run demo или lemon run live --port PORT; прежний --source удалён.",
                 )
             }
-            "--replay" => return Some("Используйте lemon replay SESSION_DIRECTORY [--speed 2]."),
+            "--replay" => {
+                return Some("Используйте lemon run replay SESSION_DIRECTORY [--speed 2].")
+            }
             "--list-ports" => return Some("Используйте lemon ports."),
             "--write-config" => return Some("Используйте lemon config init FILE."),
             _ => {}
@@ -521,9 +896,11 @@ pub fn legacy_hint(args: &[String]) -> Option<&'static str> {
     if args
         .iter()
         .any(|a| a == "--port" || a.starts_with("--port="))
-        && !args.iter().any(|a| matches!(a.as_str(), "live" | "probe"))
+        && !args
+            .iter()
+            .any(|a| matches!(a.as_str(), "live" | "probe" | "experiment"))
     {
-        return Some("Используйте lemon live --port PORT [--baud 115200].");
+        return Some("Используйте lemon run live --port PORT [--baud 115200].");
     }
     None
 }
@@ -544,6 +921,14 @@ pub enum ReportAction {
 #[cfg(test)]
 mod plugin_cli_tests {
     use super::*;
+    fn normalized(args: &[&str]) -> String {
+        let mut cli = Cli::try_parse_from(args).expect("CLI");
+        cli.normalize_run();
+        format!(
+            "{:?}|{:?}|{:?}|{}|{:?}|{}",
+            cli.command, cli.config, cli.channels, cli.record, cli.duration, cli.headless
+        )
+    }
     #[test]
     fn parses_registry_commands() {
         for args in [
@@ -579,5 +964,280 @@ mod plugin_cli_tests {
                 command: PluginAction::Run { timeout: 7, .. }
             })
         ));
+    }
+    #[test]
+    fn parses_experiment_run_contract() {
+        let cli = Cli::try_parse_from([
+            "lemon",
+            "experiment",
+            "run",
+            "--protocol",
+            "examples/motor-imagery-demo.json",
+            "--demo",
+            "--headless",
+            "--record",
+            "--time-scale",
+            "0.01",
+        ])
+        .expect("CLI");
+        assert!(cli.record && cli.headless);
+        assert!(matches!(
+            cli.command,
+            Some(Action::Experiment {
+                command: ExperimentAction::Run { demo: true, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn canonical_modes_parse_including_offline_study() {
+        for args in [
+            vec!["lemon", "run", "demo"],
+            vec!["lemon", "run", "live", "--port", "serial"],
+            vec!["lemon", "run", "replay", "recording"],
+            vec!["lemon", "run", "analyze", "recording"],
+            vec![
+                "lemon",
+                "run",
+                "study",
+                "--manifest",
+                "study.json",
+                "--output",
+                "reports/study",
+                "--config",
+                "dsp.json",
+                "--overwrite",
+            ],
+            vec![
+                "lemon",
+                "run",
+                "experiment",
+                "--protocol",
+                "protocol.json",
+                "--demo",
+            ],
+            vec![
+                "lemon",
+                "run",
+                "plugin",
+                "example",
+                "--input",
+                "analysis",
+                "--config",
+                "plugin.json",
+                "--output",
+                "result",
+            ],
+            vec!["lemon", "run", "report", "create", "analysis"],
+            vec!["lemon", "run", "report", "setup", "--recreate"],
+            vec!["lemon", "run", "report", "healthcheck"],
+        ] {
+            Cli::try_parse_from(args).expect("canonical command");
+        }
+        let error = Cli::try_parse_from(["lemon", "run", "study"])
+            .expect_err("study requires manifest and output");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn canonical_and_legacy_modes_normalize_to_identical_requests() {
+        for (canonical, legacy) in [
+            (
+                vec![
+                    "lemon",
+                    "run",
+                    "live",
+                    "--port",
+                    "a",
+                    "--baud",
+                    "9600",
+                    "--protocol",
+                    "csv",
+                    "--sample-rate",
+                    "250",
+                    "--units",
+                    "counts",
+                    "--startup-delay-ms",
+                    "20",
+                    "--channels",
+                    "2",
+                    "--record",
+                ],
+                vec![
+                    "lemon",
+                    "live",
+                    "--port",
+                    "a",
+                    "--baud",
+                    "9600",
+                    "--protocol",
+                    "csv",
+                    "--sample-rate",
+                    "250",
+                    "--units",
+                    "counts",
+                    "--startup-delay-ms",
+                    "20",
+                    "--channels",
+                    "2",
+                    "--record",
+                ],
+            ),
+            (
+                vec![
+                    "lemon",
+                    "run",
+                    "replay",
+                    "input.dat",
+                    "--speed",
+                    "2",
+                    "--sample-rate",
+                    "250",
+                    "--channel-name",
+                    "A0",
+                    "--headless",
+                ],
+                vec![
+                    "lemon",
+                    "replay",
+                    "input.dat",
+                    "--speed",
+                    "2",
+                    "--sample-rate",
+                    "250",
+                    "--channel-name",
+                    "A0",
+                    "--headless",
+                ],
+            ),
+            (
+                vec![
+                    "lemon",
+                    "run",
+                    "analyze",
+                    "input.dmov",
+                    "--output",
+                    "analysis",
+                    "--overwrite",
+                    "--sample-rate",
+                    "250",
+                    "--units",
+                    "counts",
+                ],
+                vec![
+                    "lemon",
+                    "analyze",
+                    "input.dmov",
+                    "--output",
+                    "analysis",
+                    "--overwrite",
+                    "--sample-rate",
+                    "250",
+                    "--units",
+                    "counts",
+                ],
+            ),
+            (
+                vec![
+                    "lemon",
+                    "run",
+                    "experiment",
+                    "--protocol",
+                    "protocol.json",
+                    "--demo",
+                    "--time-scale",
+                    "0.1",
+                    "--headless",
+                    "--record",
+                ],
+                vec![
+                    "lemon",
+                    "experiment",
+                    "run",
+                    "--protocol",
+                    "protocol.json",
+                    "--demo",
+                    "--time-scale",
+                    "0.1",
+                    "--headless",
+                    "--record",
+                ],
+            ),
+            (
+                vec![
+                    "lemon",
+                    "run",
+                    "plugin",
+                    "example",
+                    "--input",
+                    "analysis",
+                    "--config",
+                    "plugin.json",
+                    "--output",
+                    "result",
+                    "--overwrite",
+                    "--timeout",
+                    "7",
+                ],
+                vec![
+                    "lemon",
+                    "plugin",
+                    "run",
+                    "example",
+                    "--input",
+                    "analysis",
+                    "--config",
+                    "plugin.json",
+                    "--output",
+                    "result",
+                    "--overwrite",
+                    "--timeout",
+                    "7",
+                ],
+            ),
+            (
+                vec![
+                    "lemon",
+                    "run",
+                    "report",
+                    "create",
+                    "recording",
+                    "--output",
+                    "report",
+                    "--no-execute",
+                    "--portable",
+                    "--include-raw",
+                    "--overwrite",
+                ],
+                vec![
+                    "lemon",
+                    "report",
+                    "recording",
+                    "--output",
+                    "report",
+                    "--no-execute",
+                    "--portable",
+                    "--include-raw",
+                    "--overwrite",
+                ],
+            ),
+            (
+                vec!["lemon", "run", "report", "setup", "--recreate"],
+                vec!["lemon", "report", "setup", "--recreate"],
+            ),
+            (
+                vec!["lemon", "run", "report", "healthcheck"],
+                vec!["lemon", "report", "doctor"],
+            ),
+        ] {
+            assert_eq!(normalized(&canonical), normalized(&legacy));
+        }
+        assert_eq!(
+            normalized(&["lemon", "run", "demo", "--duration", "1"]),
+            normalized(&["lemon", "demo", "--duration", "1"])
+        );
     }
 }

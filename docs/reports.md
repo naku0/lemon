@@ -1,11 +1,11 @@
 # Jupyter-отчёты
 
-`lemon report` создаёт notebook с таблицами и графиками. Он использует готовый AnalysisBundle и не выполняет фильтрацию, FFT или расчёт band power заново.
+`lemon run report create` создаёт notebook с таблицами и графиками. Он использует готовый AnalysisBundle и не выполняет фильтрацию, FFT или расчёт band power заново.
 
 ## Самый простой вариант
 
 ```bash
-lemon report recording.csv --output reports/recording
+lemon run report create recording.csv --output reports/recording
 ```
 
 Команда сначала выполнит `analyze`, затем создаст и выполнит notebook через управляемое Python-окружение. Она не открывает браузер без `--open`.
@@ -24,13 +24,13 @@ reports/recording/
 ## 1. Настройте Python один раз
 
 ```bash
-lemon report setup
-lemon report doctor
+lemon run report setup
+lemon run report healthcheck
 ```
 
 `setup` создаёт отдельный venv LEMON в каталоге данных ОС и устанавливает зависимости отчётов. Системный Python и окружение проекта не изменяются.
 
-Успешный `doctor` показывает:
+Успешный `healthcheck` показывает:
 
 - путь к Python внутри venv;
 - версии `numpy`, `pandas`, `matplotlib`, `nbformat`, `nbclient` и `ipykernel`;
@@ -39,7 +39,7 @@ lemon report doctor
 Если окружение повреждено:
 
 ```bash
-lemon report setup --recreate
+lemon run report setup --recreate
 ```
 
 ## 2. Создайте локальный выполненный отчёт
@@ -47,7 +47,7 @@ lemon report setup --recreate
 Из исходной записи:
 
 ```bash
-lemon report recording.dat \
+lemon run report create recording.dat \
   --sample-rate 250 \
   --output reports/recording
 ```
@@ -55,7 +55,7 @@ lemon report recording.dat \
 Из уже готового AnalysisBundle:
 
 ```bash
-lemon report \
+lemon run report create \
   --analysis reports/recording-analysis \
   --output reports/recording
 ```
@@ -63,7 +63,7 @@ lemon report \
 Открыть notebook после создания:
 
 ```bash
-lemon report INPUT --output reports/recording --open
+lemon run report create INPUT --output reports/recording --open
 ```
 
 Без `--open` GUI не запускается.
@@ -73,7 +73,7 @@ lemon report INPUT --output reports/recording --open
 Чтобы только сгенерировать `.ipynb`:
 
 ```bash
-lemon report INPUT \
+lemon run report create INPUT \
   --no-execute \
   --output reports/recording
 ```
@@ -83,7 +83,7 @@ lemon report INPUT \
 ## Переносимый ZIP
 
 ```bash
-lemon report INPUT --portable --output reports/recording
+lemon run report create INPUT --portable --output reports/recording
 ```
 
 Рядом появится `.lemon-report.zip` с notebook, полным AnalysisBundle, PNG, manifest, requirements и README. После распаковки относительные пути продолжают работать.
@@ -91,7 +91,7 @@ lemon report INPUT --portable --output reports/recording
 ## Один notebook для Google Colab
 
 ```bash
-lemon report INPUT --colab --output reports/recording-colab
+lemon run report create INPUT --colab --output reports/recording-colab
 ```
 
 LEMON встраивает компактный Report Dataset в `.ipynb`. Для стандартного просмотра отдельные CSV загружать не нужно.
@@ -99,7 +99,7 @@ LEMON встраивает компактный Report Dataset в `.ipynb`. Дл
 Попытаться добавить полный sample-level Raw:
 
 ```bash
-lemon report INPUT --colab --include-raw \
+lemon run report create INPUT --colab --include-raw \
   --output reports/recording-colab-raw
 ```
 
@@ -110,10 +110,10 @@ lemon report INPUT --colab --include-raw \
 Откройте `report.ipynb` и выберите kernel из управляемого окружения, путь к которому показывает:
 
 ```bash
-lemon report doctor
+lemon run report healthcheck
 ```
 
-Если редактор выбрал `/usr/local/bin/python3`, может появиться `ModuleNotFoundError`, даже когда `doctor` успешен: это другой Python.
+Если редактор выбрал `/usr/local/bin/python3`, может появиться `ModuleNotFoundError`, даже когда `healthcheck` успешен: это другой Python.
 
 ## Где смотреть статус
 
@@ -122,10 +122,10 @@ lemon report doctor
 ## Частые команды
 
 ```bash
-lemon report --help
-lemon report doctor
-lemon report setup --recreate
-lemon report --analysis ANALYSIS --no-execute --output REPORT
+lemon run report --help
+lemon run report healthcheck
+lemon run report setup --recreate
+lemon run report create --analysis ANALYSIS --no-execute --output REPORT
 ```
 
 Дополнительные решения находятся в [troubleshooting.md](troubleshooting.md#notebook-не-выполняется).

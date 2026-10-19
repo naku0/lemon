@@ -291,7 +291,23 @@ impl Processor {
                 sample_rate_hz: block.sample_rate_hz,
                 source: block.source.clone(),
                 synchronized_clock: block.synchronized_clock,
-                flags: block.flags.clone(),
+                // Block-level continuity faults describe the boundary before
+                // this block. Applying them to every internal sample would
+                // reject the whole block and restart warmup repeatedly.
+                flags: block
+                    .flags
+                    .iter()
+                    .copied()
+                    .filter(|flag| {
+                        index == 0
+                            || !matches!(
+                                flag,
+                                SignalFlag::LostSample
+                                    | SignalFlag::InvalidPacket
+                                    | SignalFlag::Disconnected
+                            )
+                    })
+                    .collect(),
                 channels: block
                     .channels
                     .iter()
@@ -1319,6 +1335,39 @@ mod tests {
             );
             assert!(output.spectrum.is_some(), "{reason}: resumed PSD");
         }
+    }
+
+    #[test]
+    fn block_continuity_flag_applies_only_to_first_internal_sample() {
+        let mut config = config(128.0);
+        config.processing.window_samples = 8;
+        config.processing.hop_samples = 4;
+        config.processing.filter_warmup_seconds = 2.0 / 128.0;
+        config.processing.outlier_step = 150.0;
+        let mut processor = Processor::new(&config).expect("processor");
+        processor
+            .process(block(&[0.0; 8], 128.0, 0))
+            .expect("baseline");
+
+        let mut recovered = block(&[200.0; 16], 128.0, 16);
+        recovered.flags.push(SignalFlag::LostSample);
+        recovered.flags.push(SignalFlag::LowQuality);
+        let output = processor.process(recovered).expect("recovery");
+
+        assert!(output.filtered_channels[0].samples[0].is_none());
+        assert!(output.filtered_channels[0].samples[1..]
+            .iter()
+            .all(Option::is_some));
+        assert!(output.sample_metadata[0][0]
+            .flags
+            .contains(&SignalFlag::LostSample));
+        assert!(output.sample_metadata[0][1..]
+            .iter()
+            .all(|metadata| !metadata.flags.contains(&SignalFlag::LostSample)));
+        assert!(output.sample_metadata[0]
+            .iter()
+            .all(|metadata| metadata.flags.contains(&SignalFlag::LowQuality)));
+        assert!(output.spectrum.is_some());
     }
 
     #[test]

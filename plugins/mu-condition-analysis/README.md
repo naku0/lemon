@@ -15,7 +15,7 @@ lemon plugins add plugins/mu-condition-analysis
 lemon plugins inspect mu-condition-analysis
 
 # Запустить
-lemon plugin run mu-condition-analysis \
+lemon run plugin mu-condition-analysis \
   --input reports/lab2-background-analysis \
   --config examples/mu-condition-analysis.json \
   --output reports/lab2-mu-condition-results
@@ -47,9 +47,9 @@ ls reports/lab2-mu-condition-results/figures
 Сначала импортируйте/проанализируйте фон и каждое условие одинаковой конфигурацией DSP:
 
 ```bash
-lemon analyze "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
+lemon run analyze "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
   --output reports/lab2-background-analysis
-lemon analyze "$HOME/Downloads/Лаб2/1 упр - сжатие правой/RECORDING.dmov" \
+lemon run analyze "$HOME/Downloads/Лаб2/1 упр - сжатие правой/RECORDING.dmov" \
   --output reports/lab2/right-hand-squeeze-analysis
 ```
 
@@ -68,7 +68,7 @@ lemon plugins add plugins/mu-condition-analysis
 ## Запуск
 
 ```bash
-lemon plugin run mu-condition-analysis \
+lemon run plugin mu-condition-analysis \
   --input reports/lab2-background-analysis \
   --config examples/mu-condition-analysis.json \
   --output reports/lab2-mu-condition-results

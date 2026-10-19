@@ -150,6 +150,13 @@ impl Bundle {
         }
         CsvRows::open(path).map(Some)
     }
+    pub fn experiment(&self) -> Result<Option<serde_json::Value>, SdkError> {
+        let path = self.directory.join("experiment.json");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
     fn rows<T: DeserializeOwned>(&self, name: &str) -> Result<CsvRows<T>, SdkError> {
         CsvRows::open(self.directory.join(name))
     }
@@ -437,12 +444,21 @@ mod tests {
     #[test]
     fn opens_and_streams_bundle() {
         let p = fixture();
+        fs::write(
+            p.join("experiment.json"),
+            r#"{"schema_version":1,"status":"completed"}"#,
+        )
+        .expect("experiment");
         let b = Bundle::open(&p).expect("bundle");
         assert_eq!(b.channels(), &["A0"]);
         assert_eq!(b.sample_rate_hz(), 250.0);
         assert_eq!(b.manifest().dsp_algorithm_version, 1);
         assert_eq!(b.manifest().psd_algorithm_version, 1);
         assert!(b.excluded_windows().expect("excluded").is_none());
+        assert_eq!(
+            b.experiment().expect("experiment").expect("present")["status"],
+            "completed"
+        );
         let rows = b
             .processed()
             .expect("rows")

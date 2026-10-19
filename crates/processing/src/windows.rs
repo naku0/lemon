@@ -33,11 +33,11 @@ impl WindowingConfig {
         }
     }
     fn validate(&self) -> Result<()> {
-        if !(2..=65536).contains(&self.window_samples)
+        if !(8..=65536).contains(&self.window_samples)
             || self.hop_samples == 0
             || self.hop_samples > self.window_samples
         {
-            return Err("windowing: window must be 2..65536 samples; hop must be 1..window".into());
+            return Err("windowing: window must be 8..65536 samples; hop must be 1..window".into());
         }
         if !self.sample_rate_hz.is_finite()
             || self.sample_rate_hz <= 0.0
@@ -307,7 +307,7 @@ mod tests {
     }
     fn run(samples: &[AnalysisSample], chunk: usize) -> Vec<WindowCandidate> {
         let mut generator =
-            WindowGenerator::new(WindowingConfig::new(4, 2, 100.0)).expect("generator");
+            WindowGenerator::new(WindowingConfig::new(8, 4, 100.0)).expect("generator");
         let mut output = Vec::new();
         for block in samples.chunks(chunk) {
             for sample in block {
@@ -320,14 +320,14 @@ mod tests {
     }
     #[test]
     fn segment_and_off_grid_artifact_restart_grid_with_one_tail() {
-        let mut samples = (0..13).map(sample).collect::<Vec<_>>();
-        for item in &mut samples[5..] {
+        let mut samples = (0..25).map(sample).collect::<Vec<_>>();
+        for item in &mut samples[10..] {
             item.segment_id = 1;
         }
-        samples[5].eligible = false;
-        samples[5].flags.push(SignalFlag::Outlier);
-        samples[6].eligible = false;
-        samples[6].flags.push(SignalFlag::FilterWarmup);
+        samples[10].eligible = false;
+        samples[10].flags.push(SignalFlag::Outlier);
+        samples[11].eligible = false;
+        samples[11].flags.push(SignalFlag::FilterWarmup);
         let output = run(&samples, 1);
         assert_eq!(output, run(&samples, 3));
         assert_eq!(output, run(&samples, 13));
@@ -338,8 +338,8 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(starts, vec![0, 7, 9]);
-        assert_eq!(output.len(), 5);
+        assert_eq!(starts, vec![0, 12, 16]);
+        assert_eq!(output.len(), 6);
         for candidate in output {
             if let WindowCandidate::Accepted {
                 segment_id,
@@ -355,7 +355,7 @@ mod tests {
     }
     #[test]
     fn missing_values_and_bad_cadence_have_all_unique_reasons() {
-        let mut samples = (0..4).map(sample).collect::<Vec<_>>();
+        let mut samples = (0..8).map(sample).collect::<Vec<_>>();
         for sample in &mut samples {
             sample.value = None;
             sample.eligible = false;
@@ -381,13 +381,14 @@ mod tests {
     }
     #[test]
     fn tail_is_once_and_invalid_config_is_rejected() {
-        let samples = (0..5).map(sample).collect::<Vec<_>>();
+        let samples = (0..9).map(sample).collect::<Vec<_>>();
         let output = run(&samples, 2);
         assert_eq!(output.len(), 2);
         assert!(
-            matches!(&output[1],WindowCandidate::Rejected { available_samples: 3, reasons, .. } if reasons == &[WindowRejectionReason::InsufficientData])
+            matches!(&output[1],WindowCandidate::Rejected { available_samples: 5, reasons, .. } if reasons == &[WindowRejectionReason::InsufficientData])
         );
-        assert!(WindowGenerator::new(WindowingConfig::new(4, 5, 100.0)).is_err());
-        assert!(WindowGenerator::new(WindowingConfig::new(4, 2, f64::NAN)).is_err());
+        assert!(WindowGenerator::new(WindowingConfig::new(8, 9, 100.0)).is_err());
+        assert!(WindowGenerator::new(WindowingConfig::new(7, 4, 100.0)).is_err());
+        assert!(WindowGenerator::new(WindowingConfig::new(8, 4, f64::NAN)).is_err());
     }
 }

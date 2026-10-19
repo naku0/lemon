@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "lab2-mu-offline",
+  "display_name": "Lab 2 Mu offline comparison",
+  "description": "Separate recordings compared with a background recording.",
+  "baseline": {
+    "label": "background",
+    "input": "background/recording.dmov"
+  },
+  "conditions": [
+    {
+      "label": "right-hand-squeeze",
+      "input": "right-hand-squeeze/recording.dmov"
+    },
+    {
+      "label": "imagined-right-hand-squeeze",
+      "input": "imagined-right-hand-squeeze/recording.dmov"
+    }
+  ]
+}

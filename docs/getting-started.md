@@ -30,7 +30,7 @@ lemon --version
 ## 2. Откройте demo
 
 ```bash
-lemon demo
+lemon run demo
 ```
 
 Откроется терминальный интерфейс с синтетическим сигналом. Оборудование и файлы для этого не нужны.
@@ -46,7 +46,7 @@ lemon demo
 ## 3. Создайте тестовую запись
 
 ```bash
-lemon demo --headless --duration 10 --record
+lemon run demo --headless --duration 10 --record
 ```
 
 Команда работает десять секунд без TUI и напечатает путь созданного сеанса. По умолчанию он находится в `recordings/` текущего каталога:
@@ -69,13 +69,13 @@ ls -lt recordings
 Подставьте каталог, который напечатал предыдущий шаг:
 
 ```bash
-lemon replay recordings/SESSION
+lemon run replay recordings/SESSION
 ```
 
 Для быстрой проверки без интерфейса:
 
 ```bash
-lemon replay recordings/SESSION --headless --duration 5
+lemon run replay recordings/SESSION --headless --duration 5
 ```
 
 Replay не изменяет исходную запись.
@@ -83,7 +83,7 @@ Replay не изменяет исходную запись.
 ## 5. Создайте AnalysisBundle
 
 ```bash
-lemon analyze recordings/SESSION \
+lemon run analyze recordings/SESSION \
   --output reports/demo-analysis
 ```
 
@@ -101,7 +101,7 @@ cat reports/demo-analysis/summary.md
 Для первого раза Python не нужен:
 
 ```bash
-lemon report \
+lemon run report create \
   --analysis reports/demo-analysis \
   --no-execute \
   --output reports/demo-report
@@ -116,14 +116,14 @@ reports/demo-report/report.ipynb
 Чтобы LEMON сам выполнял notebook и сохранял графики, один раз настройте окружение:
 
 ```bash
-lemon report setup
-lemon report doctor
+lemon run report setup
+lemon run report healthcheck
 ```
 
 После успешного `doctor`:
 
 ```bash
-lemon report \
+lemon run report create \
   --analysis reports/demo-analysis \
   --output reports/demo-report-executed
 ```

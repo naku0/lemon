@@ -1,13 +1,18 @@
 # Plugin Platform
 
-Plugin Platform подключает локальные аналитические инструменты к готовому `AnalysisBundle`. Плагин работает после `lemon analyze`, в отдельном процессе, и создаёт собственные артефакты. Платформа не является частью live DSP и не содержит знаний о конкретных физиологических методиках.
+Plugin Platform подключает локальные аналитические инструменты к готовому `AnalysisBundle`. Плагин работает после `lemon run analyze`, в отдельном процессе, и создаёт собственные артефакты. Платформа не является частью live DSP и не содержит знаний о конкретных физиологических методиках.
+
+Для сравнения отдельных записей `lemon run study` создаёт совместимые bundle и
+`mu-condition-analysis.json`; затем пользователь явно запускает
+`mu-condition-analysis`. Для одной экспериментальной записи с markers применяется
+`mu-erd`. Подробный offline-сценарий описан в [studies.md](studies.md).
 
 ## Если вы хотите просто запустить готовый плагин
 
 Нужны три вещи:
 
 1. собранный исполняемый файл плагина;
-2. AnalysisBundle от `lemon analyze`;
+2. AnalysisBundle от `lemon run analyze`;
 3. JSON-конфигурация конкретного плагина.
 
 На примере `example-summary`:
@@ -25,7 +30,7 @@ lemon plugins list
 lemon plugins inspect example-summary
 
 # 4. Запустить
-lemon plugin run example-summary \
+lemon run plugin example-summary \
   --input reports/demo-analysis \
   --config examples/plugins/example-summary/config.json \
   --output reports/example-plugin-result
@@ -79,7 +84,7 @@ lemon plugins remove my-plugin
 ## Запуск и модель безопасности
 
 ```bash
-lemon plugin run example-summary \
+lemon run plugin example-summary \
   --input /absolute/path/to/analysis \
   --config ./plugin-config.json \
   --output ./plugin-output \
@@ -140,7 +145,7 @@ Example находится в `examples/plugins/example-summary/`:
 ```bash
 cargo build --release --manifest-path examples/plugins/example-summary/Cargo.toml
 lemon plugins add examples/plugins/example-summary
-lemon plugin run example-summary --input ANALYSIS_DIR \
+lemon run plugin example-summary --input ANALYSIS_DIR \
   --config examples/plugins/example-summary/config.json --output OUTPUT_DIR
 ```
 
@@ -161,17 +166,17 @@ AnalysisBundle остаётся открытым файловым контрак
 ### 1. Подготовьте background bundle
 
 ```bash
-lemon analyze "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
+lemon run analyze "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
   --output reports/lab2-background-analysis
 ```
 
 ### 2. Подготовьте bundles упражнений
 
 ```bash
-lemon analyze "$HOME/Downloads/Лаб2/1 упр - сжатие правой/RECORDING.dmov" \
+lemon run analyze "$HOME/Downloads/Лаб2/1 упр - сжатие правой/RECORDING.dmov" \
   --output reports/lab2/right-hand-squeeze-analysis
 
-lemon analyze "$HOME/Downloads/Лаб2/2 упр - воображаемое сжатие/RECORDING.dmov" \
+lemon run analyze "$HOME/Downloads/Лаб2/2 упр - воображаемое сжатие/RECORDING.dmov" \
   --output reports/lab2/imagined-squeeze-analysis
 ```
 
@@ -223,7 +228,7 @@ plugins/mu-condition-analysis/target/release/mu-condition-analysis
 ### 6. Запустите сравнение
 
 ```bash
-lemon plugin run mu-condition-analysis \
+lemon run plugin mu-condition-analysis \
   --input reports/lab2-background-analysis \
   --config examples/mu-condition-analysis.json \
   --output reports/lab2-mu-condition-results
@@ -262,4 +267,29 @@ open reports/lab2-mu-condition-results/figures/mu-band-comparison.png
 
 Mu-плагин использует этот же путь. Для Bundle v2 per-sample metadata является основой пригодности; события агрегированного качества не применяются второй раз. Для v1 адаптер восстанавливает сегменты по sequence/time, учитывает доступные флаги и совпадающие по времени известные события; менее строгая оценка отмечается предупреждением.
 
-Плагин сверяет `windowing_algorithm_version` входных bundle. При его отсутствии вход отмечается старой версией 0; текущая сетка плагина — 1. DSP v2 и v3 нельзя смешивать в одном сравнении: повторно выполните `lemon analyze` для всех условий.
+Плагин сверяет `windowing_algorithm_version` входных bundle. При его отсутствии вход отмечается старой версией 0; текущая сетка плагина — 1. DSP v2 и v3 нельзя смешивать в одном сравнении: повторно выполните `lemon run analyze` для всех условий.
+
+## Event-locked Mu/Beta по trials
+
+`mu-condition-analysis` сравнивает отдельные записи. Новый `mu-erd` использует
+baseline/cue/task markers и trial numbers внутри одного AnalysisBundle от
+`lemon run experiment` → `lemon run analyze`.
+
+```bash
+cargo build --locked --release -p mu-erd --target-dir plugins/mu-erd/target
+lemon plugins add plugins/mu-erd
+lemon run plugin mu-erd \
+  --input reports/session-analysis \
+  --config examples/mu-erd.json \
+  --output reports/session-mu-erd
+```
+
+Плагин использует общий WindowGenerator и PSD, сохраняет per-trial/per-window CSV,
+медиану/IQR по trials, причины исключений и PNG. Версии DSP/PSD/windowing и хеши
+входов включены в provenance. Требуются Bundle v2 / DSP v3 и experiment sidecar.
+Cancelled experiment допускается только с `allow_cancelled=true`; неполные и
+paused trials исключаются. Нельзя считать окна, пересекающие cue/task, baseline.
+
+[Пошаговая инструкция и ограничения](../plugins/mu-erd/README.md).
+Serial markers не являются аппаратными triggers. A0/A2 сохраняют исходные имена;
+физиологических выводов и автоматического назначения C3/C4 нет.

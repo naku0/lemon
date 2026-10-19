@@ -6,7 +6,7 @@
 git status --short
 cargo build --locked
 cargo test --locked --workspace
-./target/debug/lemon demo
+./target/debug/lemon run demo
 ```
 
 Во время разработки запускайте `./target/debug/lemon`: он обновляется командой `cargo build`. Глобальная команда `lemon` обновляется отдельно:
@@ -60,7 +60,7 @@ Example-плагин собирается отдельно и затем под�
 cargo build --release --manifest-path examples/plugins/example-summary/Cargo.toml
 cargo run --locked -p app -- plugins add examples/plugins/example-summary
 cargo run --locked -p app -- plugins inspect example-summary
-cargo run --locked -p app -- plugin run example-summary \
+cargo run --locked -p app -- run plugin example-summary \
   --input /absolute/path/to/analysis \
   --config examples/plugins/example-summary/config.json \
   --output /tmp/lemon-example-plugin-output
@@ -82,12 +82,49 @@ git status --short
 
 ```bash
 lemon --help
-lemon live --help
+lemon run --help
+lemon run live --help
 lemon probe --help
-lemon analyze --help
-lemon report --help
+lemon run analyze --help
+lemon run report --help
 lemon plugins --help
-lemon plugin run --help
+lemon run plugin --help
+lemon run experiment --help
+```
+
+## CLI migration
+
+Старые формы остаются совместимыми и проходят через те же внутренние запросы.
+Они скрыты из обычного help и пока не печатают предупреждений:
+
+| Legacy | Canonical |
+|---|---|
+| `lemon live …` | `lemon run live …` |
+| `lemon demo …` | `lemon run demo …` |
+| `lemon replay INPUT …` | `lemon run replay INPUT …` |
+| `lemon analyze INPUT …` | `lemon run analyze INPUT …` |
+| `lemon experiment run …` | `lemon run experiment …` |
+| `lemon plugin run …` | `lemon run plugin …` |
+| `lemon report INPUT …` | `lemon run report create INPUT …` |
+| `lemon report setup …` | `lemon run report setup …` |
+| `lemon report doctor` | `lemon run report healthcheck` |
+
+Offline study подключён вариантом `RunAction::Study`. Его orchestration и атомарная
+публикация находятся в crate `study`, а CLI только передаёт manifest, эффективный DSP
+config и output. Детерминированные тесты используют синтетические CSV, DAT и DMOV:
+
+```bash
+cargo test --locked -p study
+./target/debug/lemon run study --help
+```
+
+Experiment engine тестируется синтетически в crate `experiment`. Ускоренный end-to-end сценарий не требует оборудования:
+
+```bash
+cargo run --locked -p app -- run experiment \
+  --protocol examples/motor-imagery-demo.json \
+  --demo --headless --time-scale 0.01 \
+  --data-dir /tmp/lemon-experiment-check
 ```
 
 Регрессия DSP v3 проверяет восстановление нового уровня после пропуска, отключения, InvalidPacket, смены источника и явного reset. Сквозной тест Mu-плагина создаёт синтетическую native session блоками 1/37/800 отсчётов: после выброса вне hop-сетки, прогрева и разрыва `analyze` и плагин должны совпасть по индексам, границам, segment ID, причинам исключения и мощности. Реальные записи не нужны.

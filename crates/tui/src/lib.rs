@@ -34,6 +34,12 @@ pub struct UiOptions {
     pub experiment_directory: String,
     pub experiment_session_name: String,
     pub plugin_registry_path: PathBuf,
+    pub experiment: Option<ExperimentUi>,
+}
+#[derive(Clone)]
+pub struct ExperimentUi {
+    pub snapshot: Arc<Mutex<experiment::Snapshot>>,
+    pub commands: SyncSender<experiment::Control>,
 }
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -61,6 +67,7 @@ enum Overlay {
     Summary(RecordingSummary),
     Details(Field),
     PluginDetails,
+    ExperimentCancel,
 }
 struct View {
     page: usize,
@@ -89,6 +96,7 @@ struct View {
     plugins: Vec<plugins::PluginInfo>,
     plugin_registry_path: PathBuf,
     plugin_selection: usize,
+    experiment: Option<ExperimentUi>,
 }
 impl View {
     fn new(config: &Config, options: UiOptions) -> Self {
@@ -145,6 +153,7 @@ impl View {
             plugins,
             plugin_registry_path,
             plugin_selection: 0,
+            experiment: options.experiment,
         }
     }
     fn accept(&mut self, b: Arc<ProcessedSignalBlock>) {
@@ -433,6 +442,17 @@ impl View {
                     KeyCode::Char('n' | 'N') | KeyCode::Esc => {}
                     _ => self.overlay = Some(Overlay::Quit),
                 },
+                Overlay::ExperimentCancel => match key.code {
+                    KeyCode::Char('y' | 'Y') => {
+                        if let Some(experiment) = &self.experiment {
+                            let _ = experiment
+                                .commands
+                                .try_send(experiment::Control::Cancel("cancelled from TUI".into()));
+                        }
+                    }
+                    KeyCode::Char('n' | 'N') | KeyCode::Esc => {}
+                    _ => self.overlay = Some(Overlay::ExperimentCancel),
+                },
                 Overlay::Reset => {
                     if matches!(key.code, KeyCode::Char('y' | 'Y')) {
                         let previous = self.settings.clone();
@@ -537,6 +557,24 @@ impl View {
             }
             return false;
         }
+        if self.page == 7 {
+            if let Some(experiment) = &self.experiment {
+                match key.code {
+                    KeyCode::Enter => {
+                        let _ = experiment.commands.try_send(experiment::Control::Start);
+                    }
+                    KeyCode::Char(' ') => {
+                        let _ = experiment
+                            .commands
+                            .try_send(experiment::Control::PauseResume);
+                    }
+                    KeyCode::Esc => self.overlay = Some(Overlay::ExperimentCancel),
+                    _ => return self.global_key(key, status, tx, config),
+                }
+                return false;
+            }
+            return self.global_key(key, status, tx, config);
+        }
         if self.page == 4 {
             match key.code {
                 KeyCode::Up => {
@@ -573,9 +611,9 @@ impl View {
         match key.code {
             KeyCode::Char('q' | 'Q') | KeyCode::Esc => return self.request_quit(status),
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
-            KeyCode::Tab => self.page = (self.page + 1) % 7,
-            KeyCode::BackTab => self.page = (self.page + 6) % 7,
-            KeyCode::Char(c @ '1'..='7') => self.page = c as usize - '1' as usize,
+            KeyCode::Tab => self.page = (self.page + 1) % 8,
+            KeyCode::BackTab => self.page = (self.page + 7) % 8,
+            KeyCode::Char(c @ '1'..='8') => self.page = c as usize - '1' as usize,
             KeyCode::Char('r' | 'R') => self.recording(tx, status),
             KeyCode::Char('m' | 'M') => {
                 if status.recording_active {
@@ -755,6 +793,7 @@ mod tests {
                 experiment_directory: Config::default().recording_dir,
                 experiment_session_name: Config::default().session.name,
                 plugin_registry_path: PathBuf::from("unused-plugins.json"),
+                experiment: None,
             },
         )
     }
@@ -1022,6 +1061,7 @@ mod tests {
                 experiment_directory: "recordings".into(),
                 experiment_session_name: "session".into(),
                 plugin_registry_path: registry,
+                experiment: None,
             },
         );
         assert_eq!(v.plugins.len(), 1);

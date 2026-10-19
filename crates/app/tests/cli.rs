@@ -288,6 +288,106 @@ fn lemon_binary_help_version_and_config_commands() {
     assert!(output.status.success(), "{:?}", output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("samples="));
 }
+
+#[test]
+fn canonical_help_hides_legacy_modes_and_describes_study() {
+    let bin = env!("CARGO_BIN_EXE_lemon");
+    let help = Command::new(bin).arg("--help").output().expect("root help");
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("run"));
+    for hidden in [
+        "\n  live ",
+        "\n  demo ",
+        "\n  replay ",
+        "\n  analyze ",
+        "\n  report ",
+    ] {
+        assert!(
+            !text.contains(hidden),
+            "legacy mode leaked into help: {hidden}"
+        );
+    }
+    let report_help = Command::new(bin)
+        .args(["run", "report", "--help"])
+        .output()
+        .expect("report help");
+    assert!(report_help.status.success());
+    let report_text = String::from_utf8_lossy(&report_help.stdout);
+    assert!(report_text.contains("healthcheck"));
+    assert!(!report_text.contains("doctor"));
+    let study_help = Command::new(bin)
+        .args(["run", "study", "--help"])
+        .output()
+        .expect("study help");
+    assert!(study_help.status.success());
+    let study_text = String::from_utf8_lossy(&study_help.stdout);
+    assert!(study_text.contains("--manifest") && study_text.contains("--output"));
+    let missing = Command::new(bin)
+        .args(["run", "study"])
+        .output()
+        .expect("study missing args");
+    assert!(!missing.status.success());
+    let missing_text = String::from_utf8_lossy(&missing.stderr);
+    assert!(missing_text.contains("--manifest") && missing_text.contains("--output"));
+}
+
+#[test]
+fn canonical_study_command_prepares_bundles() {
+    let temp = Temp::new();
+    let baseline = temp.0.join("baseline.csv");
+    let condition = temp.0.join("condition.csv");
+    let rows = (0..32)
+        .map(|index| format!("{:.3},{}\n", index as f64 / 250.0, index % 8))
+        .collect::<String>();
+    fs::write(&baseline, format!("time,A0\n{rows}")).expect("baseline");
+    fs::write(&condition, format!("time,A0\n{rows}")).expect("condition");
+    let manifest = temp.0.join("study.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "id": "cli-study",
+            "display_name": "CLI study",
+            "description": "Synthetic CLI fixture",
+            "baseline": {"label": "background", "input": "baseline.csv"},
+            "conditions": [{"label": "condition", "input": "condition.csv"}]
+        }))
+        .expect("manifest JSON"),
+    )
+    .expect("manifest");
+    let mut config = Config::default();
+    config.source.channels = 1;
+    config.source.sample_rate_hz = 250.0;
+    config.source.units = Some("counts".into());
+    config.processing.window_samples = 8;
+    config.processing.hop_samples = 4;
+    config.processing.filter_warmup_seconds = 0.0;
+    let config_path = temp.0.join("config.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("config JSON"),
+    )
+    .expect("config");
+    let output = temp.0.join("output");
+    let command = Command::new(env!("CARGO_BIN_EXE_lemon"))
+        .args(["run", "study", "--manifest"])
+        .arg(&manifest)
+        .args(["--output"])
+        .arg(&output)
+        .args(["--config"])
+        .arg(&config_path)
+        .env_remove("LEMON_CONFIG")
+        .env_remove("LEMON_DATA_DIR")
+        .env_remove("LEMON_LOG")
+        .output()
+        .expect("run study");
+    assert!(command.status.success(), "{:?}", command);
+    assert!(output.join("study-manifest.json").is_file());
+    assert!(output.join("background/manifest.json").is_file());
+    assert!(output.join("condition/manifest.json").is_file());
+}
+
 #[test]
 fn two_live_ports_infer_two_channels() {
     let c = parse(&["lemon", "live", "--port", "a", "--port", "b"]);

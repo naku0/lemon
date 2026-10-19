@@ -1,17 +1,17 @@
 # Технический анализ
 
-`lemon analyze` превращает запись в открытый набор JSON и CSV. Этот набор называется **AnalysisBundle**. Его можно читать вручную, открыть в Python или передать генератору отчётов и плагинам.
+`lemon run analyze` превращает запись в открытый набор JSON и CSV. Этот набор называется **AnalysisBundle**. Его можно читать вручную, открыть в Python или передать генератору отчётов и плагинам.
 
 ## Быстрый пример
 
 ```bash
-lemon analyze recording.csv --output reports/recording-analysis
+lemon run analyze recording.csv --output reports/recording-analysis
 ```
 
 Для DAT без надёжной частоты:
 
 ```bash
-lemon analyze recording.dat \
+lemon run analyze recording.dat \
   --sample-rate 250 \
   --output reports/recording-analysis
 ```
@@ -19,7 +19,7 @@ lemon analyze recording.dat \
 Для уже записанного сеанса LEMON:
 
 ```bash
-lemon analyze recordings/session-name \
+lemon run analyze recordings/session-name \
   --output reports/session-analysis
 ```
 
@@ -78,7 +78,7 @@ wc -l reports/recording-analysis/*.csv
 Повторный анализ не нужен:
 
 ```bash
-lemon report \
+lemon run report create \
   --analysis reports/recording-analysis \
   --output reports/recording-report
 ```
@@ -86,7 +86,7 @@ lemon report \
 Или запустите аналитический плагин:
 
 ```bash
-lemon plugin run PLUGIN_ID \
+lemon run plugin PLUGIN_ID \
   --input reports/recording-analysis \
   --config plugin-config.json \
   --output reports/plugin-result
@@ -119,7 +119,7 @@ Raw → проверка порядка и чисел → артефакты →
 
 PSD использует вычитание среднего, symmetric Hann и one-sided нормировку в `signal_units²/Hz`. Мощность диапазона — сумма PSD bins с умножением на `Δf` для полуоткрытой границы `low ≤ f < high`. Относительная мощность делится на всю non-DC PSD.
 
-Bundle v1 остаётся читаемым и считается `dsp_algorithm_version: 1`; прежние bundle v2 с DSP v2 также читаются. Отсутствующий `windowing_algorithm_version` означает старую сетку (0). Новые результаты используют DSP v3 и windowing v1 при неизменном файловом формате v2. Для строгого сравнения с новыми результатами исходную запись следует повторно обработать командой `lemon analyze`.
+Bundle v1 остаётся читаемым и считается `dsp_algorithm_version: 1`; прежние bundle v2 с DSP v2 также читаются. Отсутствующий `windowing_algorithm_version` означает старую сетку (0). Новые результаты используют DSP v3 и windowing v1 при неизменном файловом формате v2. Для строгого сравнения с новыми результатами исходную запись следует повторно обработать командой `lemon run analyze`.
 
 ### Настройки и учёт окон
 
@@ -175,12 +175,14 @@ Filtered-статистика включает конечные значения
 Выберите новый каталог или явно замените только указанный результат:
 
 ```bash
-lemon analyze INPUT --output reports/analysis-2
-lemon analyze INPUT --output reports/analysis --overwrite
+lemon run analyze INPUT --output reports/analysis-2
+lemon run analyze INPUT --output reports/analysis --overwrite
 ```
 
 Полный список опций:
 
 ```bash
-lemon analyze --help
+lemon run analyze --help
 ```
+
+Если native session содержит `experiment.json`, анализ проверяет, копирует его без изменения в AnalysisBundle и перечисляет в `manifest.output_files`. Так будущие event-locked плагины получают resolved plan и фактические markers, не разбирая внутреннее состояние TUI.

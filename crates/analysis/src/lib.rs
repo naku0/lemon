@@ -499,9 +499,10 @@ fn window_name(window: core_types::WindowFunction) -> &'static str {
 }
 fn source_hashes(input: &Path, meta: &Metadata) -> Result<BTreeMap<String, String>, String> {
     let files = if input.is_dir() && input.join("metadata.json").is_file() {
-        ["metadata.json", "raw.csv", "events.csv"]
+        ["metadata.json", "raw.csv", "events.csv", "experiment.json"]
             .iter()
             .map(|n| input.join(n))
+            .filter(|path| path.is_file())
             .collect::<Vec<_>>()
     } else if let Some(p) = &meta.provenance {
         p.files_used.iter().map(PathBuf::from).collect()
@@ -633,6 +634,18 @@ pub fn analyze(
     validate_output(&input.path, &output, options.overwrite)?;
     let staging = Staging::new(&output)?;
     let temp = &staging.0;
+    let experiment_sidecar = input.path.join("experiment.json");
+    let has_experiment = experiment_sidecar.is_file();
+    if has_experiment {
+        let bytes = fs::read(&experiment_sidecar)
+            .map_err(|e| format!("analyze/experiment {}: {e}", experiment_sidecar.display()))?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("analyze/experiment: sidecar exceeds 4 MiB".into());
+        }
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| format!("analyze/experiment: invalid JSON: {e}"))?;
+        fs::write(temp.join("experiment.json"), bytes).map_err(|e| e.to_string())?;
+    }
     let mut processed =
         csv::Writer::from_path(temp.join("processed.csv")).map_err(|e| e.to_string())?;
     processed
@@ -1035,7 +1048,8 @@ pub fn analyze(
             .map(|p| p.time_normalization.clone())
             .unwrap_or_else(|| meta.timestamp_basis.clone()),
         analysis_warnings: warnings.clone(),
-        output_files: vec![
+        output_files: {
+            let mut files = vec![
             "manifest.json".to_string(),
             "summary.json".to_string(),
             "summary.md".to_string(),
@@ -1044,7 +1058,12 @@ pub fn analyze(
             "band-power.csv".to_string(),
             "quality-events.csv".to_string(),
             "excluded-windows.csv".to_string(),
-        ],
+            ];
+            if has_experiment {
+                files.push("experiment.json".into());
+            }
+            files
+        },
         psd_units: "Processor PSD units (signal units squared/Hz)".into(),
         dsp_algorithm_version: 3,
         windowing_algorithm_version: processing::windows::WINDOWING_ALGORITHM_VERSION,
@@ -1132,6 +1151,7 @@ fn validate_output(input: &Path, output: &Path, overwrite: bool) -> Result<(), S
         "band-power.csv",
         "quality-events.csv",
         "excluded-windows.csv",
+        "experiment.json",
     ];
     if !target.join("manifest.json").is_file() || !target.join("summary.json").is_file() {
         return Err("analyze/output: --overwrite requires an existing AnalysisBundle".into());

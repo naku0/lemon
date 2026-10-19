@@ -136,6 +136,8 @@ def tui_run(config, exit_key, record):
         hold(master, output, 0.2)
         os.write(master, b"7")
         wait_for(master, output, "Plugins — local registry")
+        os.write(master, b"8")
+        wait_for(master, output, "No experiment protocol is active")
         os.write(master, b"2")
         if record:
             os.write(master, b"r")
@@ -243,7 +245,7 @@ def main():
                                 capture_output=True, timeout=8, env=ENV)
         assert replay.returncode == 0, replay.stderr
         assert f"samples={len(rows) * 2}".encode() in replay.stdout, replay.stdout
-        print(f"PASS LEMON: Settings/theme/save, Help/Esc, reset cancel, seven screens including Plugins, band history, marker, pause, exit confirmation; {len(rows)} raw rows; replay exact sample count")
+        print(f"PASS LEMON: Settings/theme/save, Help/Esc, reset cancel, eight screens including Plugins/Experiment, band history, marker, pause, exit confirmation; {len(rows)} raw rows; replay exact sample count")
         (tmp / "settings.json").unlink()  # each run starts with the documented default theme
         tui_run(path, b"\x03", False)
         print("PASS TUI Ctrl+C: raw mode, alternate screen and cursor restored")

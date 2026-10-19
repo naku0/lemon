@@ -93,32 +93,32 @@ lemon probe --port PORT --baud 115200 \
 Проверьте управляемое окружение:
 
 ```bash
-lemon report doctor
+lemon run report healthcheck
 ```
 
 Если оно отсутствует или повреждено:
 
 ```bash
-lemon report setup --recreate
-lemon report doctor
+lemon run report setup --recreate
+lemon run report healthcheck
 ```
 
 LEMON создаёт отдельный venv в каталоге данных приложения. Пакеты не нужно устанавливать в системный Python.
 
-Если notebook открыт вручную в VS Code или Jupyter, выберите kernel из пути, который показывает `lemon report doctor`. Иначе редактор может использовать `/usr/local/bin/python3` без `matplotlib` и `ipykernel`.
+Если notebook открыт вручную в VS Code или Jupyter, выберите kernel из пути, который показывает `lemon run report healthcheck`. Иначе редактор может использовать `/usr/local/bin/python3` без `matplotlib` и `ipykernel`.
 
 ## Output уже существует
 
 LEMON защищает существующие результаты. Выберите новый путь:
 
 ```bash
-lemon analyze INPUT --output reports/analysis-2
+lemon run analyze INPUT --output reports/analysis-2
 ```
 
 Либо явно разрешите замену точно указанного каталога:
 
 ```bash
-lemon analyze INPUT --output reports/analysis --overwrite
+lemon run analyze INPUT --output reports/analysis --overwrite
 ```
 
 Проверяйте путь перед `--overwrite`.

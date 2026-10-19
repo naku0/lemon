@@ -624,6 +624,7 @@ pub enum Command {
     ToggleRecording,
     StartRecording(RecordingRequest),
     Marker(String),
+    StructuredEvent(Event),
     Disconnect,
 }
 #[derive(Debug, Clone)]

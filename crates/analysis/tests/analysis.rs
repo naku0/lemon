@@ -184,6 +184,43 @@ fn bundle_has_all_files_and_neutral_summary() {
 }
 
 #[test]
+fn experiment_sidecar_is_preserved_for_future_plugins() {
+    let temp = Temp::new();
+    let input = session(&temp.0, 32, 10.0);
+    let sidecar = serde_json::json!({
+        "schema_version": 1,
+        "protocol": {"id": "test-protocol", "source_file_hash": "sha256test"},
+        "resolved_plan": [],
+        "events": []
+    });
+    fs::write(
+        input.join("experiment.json"),
+        serde_json::to_vec_pretty(&sidecar).expect("JSON"),
+    )
+    .expect("sidecar");
+    let bundle = analyze(
+        AnalysisInput { path: input },
+        AnalysisOptions {
+            output: Some(temp.0.join("experiment-analysis")),
+            ..Default::default()
+        },
+    )
+    .expect("analysis");
+    let copied: serde_json::Value = serde_json::from_slice(
+        &fs::read(bundle.directory.join("experiment.json")).expect("copied sidecar"),
+    )
+    .expect("copied JSON");
+    assert_eq!(copied, sidecar);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(bundle.directory.join("manifest.json")).expect("manifest"),
+    )
+    .expect("manifest JSON");
+    assert!(manifest["output_files"]
+        .as_array()
+        .is_some_and(|files| files.iter().any(|file| file == "experiment.json")));
+}
+
+#[test]
 fn warmup_is_machine_readable_in_processed_and_excluded_windows() {
     let t = Temp::new();
     let input = session(&t.0, 16, 10.0);

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -52,6 +52,33 @@ fn run() -> Result<()> {
         return Err(hint.into());
     }
     let mut cli = Cli::parse();
+    cli.normalize_run();
+    let experiment_request = if let Some(Action::Experiment {
+        command:
+            cli::ExperimentAction::Run {
+                protocol,
+                demo,
+                time_scale,
+                ..
+            },
+    }) = &cli.command
+    {
+        if *time_scale != 1.0 && !(*demo && cli.headless) {
+            return Err("experiment: --time-scale is restricted to --demo --headless".into());
+        }
+        let (loaded, hash) = experiment::Protocol::load(protocol)?;
+        let protocol = loaded.scaled(*time_scale)?;
+        let plan = protocol.resolve()?;
+        cli.record = true;
+        Some(ExperimentRequest {
+            protocol,
+            protocol_hash: hash,
+            plan,
+            headless: cli.headless,
+        })
+    } else {
+        None
+    };
     if matches!(
         cli.command,
         Some(Action::Plugins { .. }) | Some(Action::Plugin { .. })
@@ -165,6 +192,9 @@ fn run() -> Result<()> {
             | Some(Action::Analyze { .. })
             | Some(Action::Report { .. })
             | Some(Action::Replay { .. })
+            | Some(Action::Run {
+                command: cli::RunAction::Study { .. }
+            })
     ) {
         let config_path = cli
             .config
@@ -177,6 +207,36 @@ fn run() -> Result<()> {
             .transpose()?
             .unwrap_or_default();
         match &cli.command {
+            Some(Action::Run {
+                command:
+                    cli::RunAction::Study {
+                        manifest,
+                        output,
+                        overwrite,
+                    },
+            }) => {
+                if cli.record || cli.headless || cli.duration.is_some() || cli.channels.is_some() {
+                    return Err(
+                        "study: --record/--headless/--duration/--channels are not applicable"
+                            .into(),
+                    );
+                }
+                let result = study::run(study::StudyRequest {
+                    manifest: manifest.clone(),
+                    output: output.clone(),
+                    config: base.clone(),
+                    overwrite: *overwrite,
+                })?;
+                println!("Study completed: {}", result.directory.display());
+                println!(
+                    "Mu condition config: {}",
+                    result
+                        .directory
+                        .join("mu-condition-analysis.json")
+                        .display()
+                );
+                return Ok(());
+            }
             Some(Action::Analyze {
                 input,
                 output,
@@ -424,6 +484,23 @@ fn run() -> Result<()> {
     }
     let source = source::open(&config.source)?;
     let mut runtime = Runtime::start(config.clone(), source, cli.record)?;
+    let (experiment_ui, experiment_worker) = if let Some(request) = experiment_request {
+        let (ui, worker) = start_experiment_controller(
+            request,
+            runtime.status.clone(),
+            runtime.commands.clone(),
+            runtime.stop.clone(),
+        )?;
+        (Some(ui), Some(worker))
+    } else {
+        (None, None)
+    };
+    let experiment_control = experiment_ui
+        .as_ref()
+        .map(|experiment| experiment.commands.clone());
+    let experiment_snapshot = experiment_ui
+        .as_ref()
+        .map(|experiment| experiment.snapshot.clone());
     let interrupt = Arc::new(AtomicBool::new(false));
     let signal = if cli.headless {
         runtime.stop.clone()
@@ -485,6 +562,17 @@ fn run() -> Result<()> {
     });
     let result = if cli.headless {
         loop {
+            let experiment_finished = experiment_ui.as_ref().is_some_and(|ui| {
+                matches!(
+                    ui.snapshot
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .status,
+                    experiment::Status::Completed
+                        | experiment::Status::Cancelled
+                        | experiment::Status::Failed
+                )
+            });
             if runtime
                 .status
                 .lock()
@@ -492,6 +580,7 @@ fn run() -> Result<()> {
                 .finished
                 || runtime.stop.load(Ordering::Relaxed)
                 || duration_limit.is_some_and(|d| started.elapsed().as_secs_f64() >= d)
+                || experiment_finished
             {
                 break;
             }
@@ -527,6 +616,7 @@ fn run() -> Result<()> {
                     experiment_session_name: resolved.experiment_session_name,
                     plugin_registry_path: plugins::default_registry_path()
                         .map_err(|e| e.to_string())?,
+                    experiment: experiment_ui,
                 },
             ) {
                 Ok(updated) => {
@@ -538,11 +628,39 @@ fn run() -> Result<()> {
             None => Err("TUI subscription missing".into()),
         }
     };
+    if experiment_snapshot.as_ref().is_some_and(|snapshot| {
+        !matches!(
+            snapshot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .status,
+            experiment::Status::Completed
+                | experiment::Status::Cancelled
+                | experiment::Status::Failed
+        )
+    }) {
+        if let Some(control) = &experiment_control {
+            let _ = control.send(experiment::Control::Cancel(
+                "LEMON stopped before protocol completion".into(),
+            ));
+        }
+    }
+    let experiment_result = experiment_worker
+        .map(|worker| {
+            worker
+                .join()
+                .map_err(|_| "Experiment worker panicked".to_string())
+        })
+        .transpose()?
+        .transpose()?;
     let final_status = runtime.shutdown();
     log_stop.store(true, Ordering::Relaxed);
     let mut logger = logging.join().map_err(|_| "Logger thread failed")?;
     let final_status = final_status?;
     result?;
+    if let Some(path) = experiment_result {
+        println!("Experiment sidecar: {}", path.display());
+    }
     let totals = format!(
         "blocks={} samples={} lost={} errors={} outliers={} consumer_blocks={} consumer_dropped={}",
         final_status.processed_blocks,
@@ -572,6 +690,197 @@ fn run() -> Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+struct ExperimentRequest {
+    protocol: experiment::Protocol,
+    protocol_hash: String,
+    plan: Vec<experiment::ResolvedTrial>,
+    headless: bool,
+}
+
+fn start_experiment_controller(
+    request: ExperimentRequest,
+    runtime_status: Arc<Mutex<core_types::RuntimeStatus>>,
+    runtime_commands: std::sync::mpsc::SyncSender<core_types::Command>,
+    stop: Arc<AtomicBool>,
+) -> Result<(tui::ExperimentUi, thread::JoinHandle<Result<PathBuf>>)> {
+    let engine = experiment::Engine::new(request.protocol.clone(), request.plan.clone())?;
+    let snapshot = Arc::new(Mutex::new(engine.snapshot()));
+    let snapshot_worker = snapshot.clone();
+    let (control_tx, control_rx) = mpsc::sync_channel(16);
+    if request.headless {
+        control_tx
+            .try_send(experiment::Control::Start)
+            .map_err(|e| format!("experiment/start: {e}"))?;
+    }
+    let ui = tui::ExperimentUi {
+        snapshot,
+        commands: control_tx,
+    };
+    let worker = thread::spawn(move || {
+        let result = (|| -> Result<PathBuf> {
+            let mut engine = engine;
+            let mut sidecar = experiment::ExperimentSidecar::new(
+                &request.protocol,
+                request.protocol_hash,
+                request.plan,
+            );
+            let recording_directory = loop {
+                if stop.load(Ordering::Relaxed) {
+                    return Err(
+                        "experiment: recording stopped before session directory was available"
+                            .into(),
+                    );
+                }
+                let path = runtime_status
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .recording
+                    .clone();
+                if let Some(path) = path {
+                    let raw = PathBuf::from(path);
+                    break raw
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .ok_or("experiment: invalid recording path")?;
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            let mut sidecar_path = sidecar.write_atomic(&recording_directory)?;
+            let publish = |events: Vec<core_types::Event>,
+                           sidecar: &mut experiment::ExperimentSidecar,
+                           path: &mut PathBuf|
+             -> Result<()> {
+                for event in events {
+                    if request.headless {
+                        println!(
+                            "{} ns | {} | {}",
+                            event.timestamp_ns, event.kind, event.text
+                        );
+                    }
+                    if runtime_commands
+                        .send(core_types::Command::StructuredEvent(event.clone()))
+                        .is_err()
+                        && !stop.load(Ordering::Relaxed)
+                    {
+                        return Err("experiment: runtime command channel closed".into());
+                    }
+                    if event.kind == "ExperimentStart" {
+                        sidecar.started_at_timestamp_ns = Some(event.timestamp_ns);
+                    }
+                    if matches!(event.kind.as_str(), "ExperimentEnd" | "ExperimentCancelled") {
+                        sidecar.ended_at_timestamp_ns = Some(event.timestamp_ns);
+                    }
+                    sidecar.events.push(event);
+                }
+                *path = sidecar.write_atomic(&recording_directory)?;
+                Ok(())
+            };
+            loop {
+                let now_ns = runtime_status
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .now_ns;
+                while let Ok(control) = control_rx.try_recv() {
+                    let events = match control {
+                        experiment::Control::Start => {
+                            if engine.snapshot().status == experiment::Status::Ready {
+                                engine.start(now_ns)?
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        experiment::Control::PauseResume => {
+                            if engine.snapshot().status == experiment::Status::Paused {
+                                vec![engine.resume(now_ns)?]
+                            } else if matches!(
+                                engine.snapshot().status,
+                                experiment::Status::Preparation
+                                    | experiment::Status::Baseline
+                                    | experiment::Status::Cue
+                                    | experiment::Status::Task
+                                    | experiment::Status::Rest
+                            ) {
+                                vec![engine.pause(now_ns)?]
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        experiment::Control::Cancel(reason) => {
+                            if matches!(
+                                engine.snapshot().status,
+                                experiment::Status::Completed
+                                    | experiment::Status::Cancelled
+                                    | experiment::Status::Failed
+                            ) {
+                                Vec::new()
+                            } else {
+                                sidecar.cancellation_reason = Some(reason.clone());
+                                vec![engine.cancel(now_ns, &reason)?]
+                            }
+                        }
+                    };
+                    publish(events, &mut sidecar, &mut sidecar_path)?;
+                }
+                let events = engine.tick(now_ns);
+                if !events.is_empty() {
+                    publish(events, &mut sidecar, &mut sidecar_path)?;
+                }
+                let current = engine.snapshot();
+                *snapshot_worker
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = current.clone();
+                if matches!(
+                    current.status,
+                    experiment::Status::Completed | experiment::Status::Cancelled
+                ) {
+                    sidecar.status = match current.status {
+                        experiment::Status::Completed => "completed",
+                        _ => "cancelled",
+                    }
+                    .into();
+                    sidecar.write_atomic(&recording_directory)?;
+                    return Ok(sidecar_path);
+                }
+                if stop.load(Ordering::Relaxed) {
+                    let fatal = runtime_status
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .fatal_error
+                        .clone();
+                    if !matches!(current.status, experiment::Status::Ready) {
+                        let reason = fatal
+                            .as_deref()
+                            .unwrap_or("LEMON stopped before protocol completion");
+                        sidecar.cancellation_reason = Some(reason.to_string());
+                        if let Ok(event) = engine.cancel(now_ns, reason) {
+                            publish(vec![event], &mut sidecar, &mut sidecar_path)?;
+                        }
+                    }
+                    sidecar.status = if fatal.is_some() {
+                        "failed"
+                    } else {
+                        "cancelled"
+                    }
+                    .into();
+                    sidecar.ended_at_timestamp_ns = Some(now_ns);
+                    sidecar.write_atomic(&recording_directory)?;
+                    return Ok(sidecar_path);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        })();
+        if result.is_err() {
+            snapshot_worker
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .status = experiment::Status::Failed;
+            stop.store(true, Ordering::Relaxed);
+        }
+        result
+    });
+    Ok((ui, worker))
 }
 
 fn plugin_command(cli: &Cli) -> Result<()> {

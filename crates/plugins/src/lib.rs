@@ -731,9 +731,10 @@ fn snapshot_bundle(root: &Path) -> Result<BTreeMap<String, (u64, u64)>> {
         "band-power.csv",
         "quality-events.csv",
         "excluded-windows.csv",
+        "experiment.json",
     ] {
         let path = root.join(name);
-        if name == "excluded-windows.csv" && !path.exists() {
+        if matches!(name, "excluded-windows.csv" | "experiment.json") && !path.exists() {
             continue;
         }
         let mut file = File::open(&path)

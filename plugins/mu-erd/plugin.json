@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "mu-erd",
+  "display_name": "Event-locked Mu-band power analysis",
+  "version": "0.2.0",
+  "api_version": 1,
+  "description": "Descriptive event-locked Mu and Beta power analysis for completed experiment recordings.",
+  "entrypoint": {
+    "program": "target/release/mu-erd",
+    "args": []
+  }
+}

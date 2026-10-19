@@ -1,4 +1,5 @@
 /target/
+**/target/
 /recordings/
 /docs/bitronics-observations.md
 

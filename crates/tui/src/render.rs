@@ -209,6 +209,7 @@ pub(super) fn draw(
             "5 Rec",
             "6 Set",
             "7 Plugins",
+            "8 Exp",
         ]
     } else {
         vec![
@@ -219,6 +220,7 @@ pub(super) fn draw(
             "5 Recording",
             "6 Settings",
             "7 Plugins",
+            "8 Experiment",
         ]
     };
     f.render_widget(
@@ -234,12 +236,15 @@ pub(super) fn draw(
         3 => bands(f, parts[2], v, status, config, &p, compact),
         4 => recording(f, parts[2], v, status),
         5 => settings(f, parts[2], v, config, &p),
-        _ => plugins(f, parts[2], v, &p),
+        6 => plugins(f, parts[2], v, &p),
+        _ => experiment_view(f, parts[2], v),
     }
     let commands = if v.page == 5 {
         "Tab Screen  Up/Down Select  Enter Edit  Left/Right Change  Space Toggle  S Save  R Reset group  ? Help  Q Quit"
     } else if v.page == 6 {
         "Tab Screen  Up/Down Select  Enter Details  A Add  Space Enable/Disable  X Remove  R Refresh  ? Help  Q Quit"
+    } else if v.page == 7 {
+        "Tab Screen  Enter Start  Space Pause/Resume timer  Esc Cancel  Q Quit"
     } else {
         "Tab Screen  R Record  M Marker  Space Pause  ? Help  Q Quit"
     };
@@ -250,7 +255,8 @@ pub(super) fn draw(
         3 => "P Absolute/Relative/Baseline  C Channel",
         4 => "Up/Down Select field  Enter Edit (before recording)",
         5 => "[/] or PgUp/PgDn: Category | Ctrl+R Reset all | Acquisition/DSP locked",
-        _ => "Plugins are inspected only; this screen never builds or runs plugin code",
+        6 => "Plugins are inspected only; this screen never builds or runs plugin code",
+        _ => "Protocol timing uses the recording timeline; EEG recording continues while paused",
     };
     let message = status.fatal_error.as_ref().unwrap_or(&v.message);
     f.render_widget(
@@ -1013,6 +1019,30 @@ fn plugins(f: &mut Frame, area: Rect, v: &View, p: &Palette) {
         area,
     );
 }
+fn experiment_view(f: &mut Frame, area: Rect, v: &View) {
+    let text = v.experiment.as_ref().map_or_else(
+        || "No experiment protocol is active. Start with `lemon experiment run`.".into(),
+        |ui| {
+            let snapshot = ui
+                .snapshot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            format!(
+                "Protocol: {}\nState: {:?}\nTrial: {} / {}\nCondition: {}\nInstruction: {}\nRemaining: {:.1} s\n\nRecording continues during protocol pause.",
+                snapshot.display_name,
+                snapshot.status,
+                snapshot
+                    .trial_number
+                    .map_or_else(|| "—".into(), |value| value.to_string()),
+                snapshot.total_trials,
+                snapshot.condition.as_deref().unwrap_or("—"),
+                snapshot.label.as_deref().unwrap_or("—"),
+                snapshot.phase_remaining_ns as f64 / 1e9,
+            )
+        },
+    );
+    para(f, area, "Experiment", text, v);
+}
 fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Palette) {
     let Some(overlay) = &v.overlay else {
         return;
@@ -1034,8 +1064,9 @@ fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Pale
     let (title,text)=match overlay {
         Overlay::Details(field) => ("Setting details (read only)", format!("{}\n\n{}\n\n{}\n\nEnter / Esc: close", field.name(), field.value(&v.settings, c), field.hint())),
         Overlay::PluginDetails => ("Plugin details",v.plugins.get(v.plugin_selection).map(|plugin|format!("Name: {}\nID: {}\nVersion: {}\nAPI: {}\nState: {}\nPath: {}\nLast check: {}\nReason: {}\n\nNo plugin code was loaded or run.",plugin.manifest.as_ref().map_or(plugin.id.as_str(),|m|m.display_name.as_str()),plugin.id,plugin.manifest.as_ref().map_or("?",|m|m.version.as_str()),plugin.manifest.as_ref().map_or("?".into(),|m|m.api_version.to_string()),plugin.state,plugin.path.display(),plugins::checked_at_text(plugin.checked_at),plugin.reason.as_deref().unwrap_or("—"))).unwrap_or_else(||"No plugin selected".into())),
-        Overlay::Help=>("LEMON Help",format!("Lightweight EEG Monitoring Of Neuroactivity\n\nTab / 1-7: screen | R: record | M: marker | Space: pause display | Q: quit\nSettings: Up/Down select; Enter edit; Left/Right change; S save; R reset group; Ctrl+R reset all.\nPlugins: A add; Space enable/disable; X remove from registry; R refresh.\nCurrent screen: {}\nWaveform: G Line/Points/Envelope; V raw/filtered/both; C channel; A scale; +/- seconds.\nBands: P absolute/relative/baseline; C channel. Recording: Up/Down, Enter edit.\nSources: D disconnect.\n\nRaw: original samples. Filtered: causal high-pass, low-pass and optional notch.\nTheta, Alpha/Mu and Beta are frequency-component power estimates.\nAlpha and Mu overlap (usually 8-13 Hz); electrode placement and experimental context distinguish them. 8-13 Hz alone is NOT MuERD.\n\nGood / Acceptable / Poor / Disconnected / Unknown: heuristic quality; not a validated clinical metric.\nPause affects display only. Raw recording continues. Gaps and absent baseline are never zeros.\nThis application is NOT a medical device. Serial clocks are reconstructed from the nominal rate; hardware timing is not verified.\n\nEsc closes Help; it does not exit LEMON.",["Sources","Waveform","Spectrum","Bands","Recording","Settings","Plugins"][v.page])),
+        Overlay::Help=>("LEMON Help",format!("Lightweight EEG Monitoring Of Neuroactivity\n\nTab / 1-8: screen | R: record | M: marker | Space: pause display | Q: quit\nSettings: Up/Down select; Enter edit; Left/Right change; S save; R reset group; Ctrl+R reset all.\nPlugins: A add; Space enable/disable; X remove from registry; R refresh.\nExperiment: Enter start; Space pause/resume timer; Esc cancel with confirmation.\nCurrent screen: {}\nWaveform: G Line/Points/Envelope; V raw/filtered/both; C channel; A scale; +/- seconds.\nBands: P absolute/relative/baseline; C channel. Recording: Up/Down, Enter edit.\nSources: D disconnect.\n\nRaw: original samples. Filtered: causal high-pass, low-pass and optional notch.\nTheta, Alpha/Mu and Beta are frequency-component power estimates.\nAlpha and Mu overlap (usually 8-13 Hz); electrode placement and experimental context distinguish them. 8-13 Hz alone is NOT MuERD.\n\nGood / Acceptable / Poor / Disconnected / Unknown: heuristic quality; not a validated clinical metric.\nPause affects display only. Raw recording continues. Gaps and absent baseline are never zeros.\nThis application is NOT a medical device. Serial clocks are reconstructed from the nominal rate; hardware timing is not verified.\n\nEsc closes Help; it does not exit LEMON.",["Sources","Waveform","Spectrum","Bands","Recording","Settings","Plugins","Experiment"][v.page])),
         Overlay::Quit=>("Confirm exit",if status.recording_active || v.record_requested{"Запись активна. Остановить запись и выйти?\n[Y] Да  [N] Вернуться\n\nQueued samples will be flushed before exit.".into()}else{"Exit LEMON?\n[Y] Yes  [N] Return".into()}),
+        Overlay::ExperimentCancel=>("Cancel experiment","Cancel the protocol? EEG recorded so far and all markers will be kept.\n[Y] Cancel  [N] Continue".into()),
         Overlay::Reset=>("Reset all settings","Reset every preference to defaults?\n[Y] Reset  [N] Return\nThis does not change experiment/DSP configuration. Save with S to persist.".into()),
         Overlay::Summary(s)=>("Recording complete",format!("{}\n\nEnter / Esc: close",summary(s))),
         Overlay::Edit(target,text)=>("Edit",format!("{}\n\n{}\n\nEnter: apply | Esc: cancel\n{}",match target{EditTarget::Setting(field)=>field.name(),EditTarget::Session(_)=>"Session field (next recording)",EditTarget::Marker=>"Marker",EditTarget::PluginPath=>"Absolute or relative plugin directory"},text,v.message)),
@@ -1111,6 +1142,7 @@ mod tests {
                 experiment_directory: c.recording_dir.clone(),
                 experiment_session_name: c.session.name.clone(),
                 plugin_registry_path: std::path::PathBuf::from("unused-plugins.json"),
+                experiment: None,
             },
         );
         v.page = 5;
@@ -1159,11 +1191,12 @@ mod tests {
                 experiment_directory: c.recording_dir.clone(),
                 experiment_session_name: c.session.name.clone(),
                 plugin_registry_path: std::path::PathBuf::from("unused-plugins.json"),
+                experiment: None,
             },
         );
         for (w, h) in [(160, 42), (80, 24), (40, 10)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-            for page in 0..7 {
+            for page in 0..8 {
                 v.page = page;
                 terminal
                     .draw(|f| draw(f, &c, &[], &v, &RuntimeStatus::default(), 0))
@@ -1195,6 +1228,7 @@ mod tests {
                 experiment_directory: c.recording_dir.clone(),
                 experiment_session_name: c.session.name.clone(),
                 plugin_registry_path: std::path::PathBuf::from("unused-plugins.json"),
+                experiment: None,
             },
         );
         for i in 0..2 {

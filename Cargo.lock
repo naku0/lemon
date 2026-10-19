@@ -85,12 +85,14 @@ dependencies = [
  "core",
  "ctrlc",
  "directories",
+ "experiment",
  "plugins",
  "processing",
  "report",
  "serde_json",
  "source",
  "storage",
+ "study",
  "tui",
 ]
 
@@ -475,6 +477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "experiment"
+version = "0.2.0"
+dependencies = [
+ "core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -696,6 +708,19 @@ dependencies = [
  "serde",
  "serde_json",
  "storage",
+]
+
+[[package]]
+name = "mu-erd"
+version = "0.2.0"
+dependencies = [
+ "csv",
+ "lemon-plugin-sdk",
+ "plugins",
+ "processing",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1124,6 +1149,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "study"
+version = "0.2.0"
+dependencies = [
+ "analysis",
+ "core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1181,6 +1217,7 @@ version = "0.2.0"
 dependencies = [
  "core",
  "crossterm",
+ "experiment",
  "plugins",
  "ratatui",
  "serde",
