@@ -1,49 +1,36 @@
 use analysis::{analyze, AnalysisBundle, AnalysisInput, AnalysisOptions};
 use app::{
-    cli::{self, Action, Cli, ConfigAction, Environment, LogLevel},
+    cli::{self, Action, Cli, Environment, LogLevel},
     Runtime,
 };
 use clap::Parser;
-use core_types::{Config, Result};
+use core_types::Result;
 use report::{render_notebook, ExecutionMode, ReportOptions};
 use std::{
-    fs,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        Arc,
     },
     thread,
     time::{Duration, Instant},
 };
 use tui::{settings::Settings, UiOptions};
 
+mod config_commands;
+mod experiment_controller;
+mod logging;
+mod plugin_commands;
+mod report_support;
+
+use logging::Logger;
+use report_support::TempAnalysis;
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("LEMON: {e}");
         std::process::exit(1);
-    }
-}
-fn open_report(path: &Path) {
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(path).status();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("explorer.exe")
-        .arg(path)
-        .status();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let result = std::process::Command::new("xdg-open").arg(path).status();
-    match result {
-        Ok(status) if !status.success() => eprintln!(
-            "LEMON: не удалось открыть notebook ({status}); путь: {}",
-            path.display()
-        ),
-        Err(e) => eprintln!(
-            "LEMON: не удалось открыть notebook: {e}; путь: {}",
-            path.display()
-        ),
-        _ => {}
     }
 }
 fn run() -> Result<()> {
@@ -53,37 +40,12 @@ fn run() -> Result<()> {
     }
     let mut cli = Cli::parse();
     cli.normalize_run();
-    let experiment_request = if let Some(Action::Experiment {
-        command:
-            cli::ExperimentAction::Run {
-                protocol,
-                demo,
-                time_scale,
-                ..
-            },
-    }) = &cli.command
-    {
-        if *time_scale != 1.0 && !(*demo && cli.headless) {
-            return Err("experiment: --time-scale is restricted to --demo --headless".into());
-        }
-        let (loaded, hash) = experiment::Protocol::load(protocol)?;
-        let protocol = loaded.scaled(*time_scale)?;
-        let plan = protocol.resolve()?;
-        cli.record = true;
-        Some(ExperimentRequest {
-            protocol,
-            protocol_hash: hash,
-            plan,
-            headless: cli.headless,
-        })
-    } else {
-        None
-    };
+    let experiment_request = experiment_controller::Request::from_cli(&mut cli)?;
     if matches!(
         cli.command,
         Some(Action::Plugins { .. }) | Some(Action::Plugin { .. })
     ) {
-        return plugin_command(&cli);
+        return plugin_commands::run(&cli);
     }
     if let Some(Action::Report {
         command: Some(command),
@@ -177,7 +139,7 @@ fn run() -> Result<()> {
             return Ok(());
         }
         if let Some(Action::Config { command }) = &cli.command {
-            return config_command(command, &cli);
+            return config_commands::run(command, &cli);
         }
     }
     let settings_path = cli::settings_path(&cli)?;
@@ -304,8 +266,8 @@ fn run() -> Result<()> {
                 let bundle = if let Some(path) = analysis {
                     AnalysisBundle::open(path)?
                 } else if let Some(path) = input {
-                    let temp = ReportTemp::new()?;
-                    let temp_path = temp.0.join("analysis");
+                    let temp = TempAnalysis::new()?;
+                    let temp_path = temp.path().join("analysis");
                     report_temp = Some(temp);
                     analyze(
                         AnalysisInput { path: path.clone() },
@@ -387,7 +349,7 @@ fn run() -> Result<()> {
                     eprintln!("LEMON: {warning}");
                 }
                 if *open {
-                    open_report(&artifacts.notebook);
+                    report_support::open(&artifacts.notebook);
                 }
                 return Ok(());
             }
@@ -485,7 +447,7 @@ fn run() -> Result<()> {
     let source = source::open(&config.source)?;
     let mut runtime = Runtime::start(config.clone(), source, cli.record)?;
     let (experiment_ui, experiment_worker) = if let Some(request) = experiment_request {
-        let (ui, worker) = start_experiment_controller(
+        let (ui, worker) = experiment_controller::start(
             request,
             runtime.status.clone(),
             runtime.commands.clone(),
@@ -692,426 +654,17 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-struct ExperimentRequest {
-    protocol: experiment::Protocol,
-    protocol_hash: String,
-    plan: Vec<experiment::ResolvedTrial>,
-    headless: bool,
-}
-
-fn start_experiment_controller(
-    request: ExperimentRequest,
-    runtime_status: Arc<Mutex<core_types::RuntimeStatus>>,
-    runtime_commands: std::sync::mpsc::SyncSender<core_types::Command>,
-    stop: Arc<AtomicBool>,
-) -> Result<(tui::ExperimentUi, thread::JoinHandle<Result<PathBuf>>)> {
-    let engine = experiment::Engine::new(request.protocol.clone(), request.plan.clone())?;
-    let snapshot = Arc::new(Mutex::new(engine.snapshot()));
-    let snapshot_worker = snapshot.clone();
-    let (control_tx, control_rx) = mpsc::sync_channel(16);
-    if request.headless {
-        control_tx
-            .try_send(experiment::Control::Start)
-            .map_err(|e| format!("experiment/start: {e}"))?;
-    }
-    let ui = tui::ExperimentUi {
-        snapshot,
-        commands: control_tx,
-    };
-    let worker = thread::spawn(move || {
-        let result = (|| -> Result<PathBuf> {
-            let mut engine = engine;
-            let mut sidecar = experiment::ExperimentSidecar::new(
-                &request.protocol,
-                request.protocol_hash,
-                request.plan,
-            );
-            let recording_directory = loop {
-                if stop.load(Ordering::Relaxed) {
-                    return Err(
-                        "experiment: recording stopped before session directory was available"
-                            .into(),
-                    );
-                }
-                let path = runtime_status
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .recording
-                    .clone();
-                if let Some(path) = path {
-                    let raw = PathBuf::from(path);
-                    break raw
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .ok_or("experiment: invalid recording path")?;
-                }
-                thread::sleep(Duration::from_millis(5));
-            };
-            let mut sidecar_path = sidecar.write_atomic(&recording_directory)?;
-            let publish = |events: Vec<core_types::Event>,
-                           sidecar: &mut experiment::ExperimentSidecar,
-                           path: &mut PathBuf|
-             -> Result<()> {
-                for event in events {
-                    if request.headless {
-                        println!(
-                            "{} ns | {} | {}",
-                            event.timestamp_ns, event.kind, event.text
-                        );
-                    }
-                    if runtime_commands
-                        .send(core_types::Command::StructuredEvent(event.clone()))
-                        .is_err()
-                        && !stop.load(Ordering::Relaxed)
-                    {
-                        return Err("experiment: runtime command channel closed".into());
-                    }
-                    if event.kind == "ExperimentStart" {
-                        sidecar.started_at_timestamp_ns = Some(event.timestamp_ns);
-                    }
-                    if matches!(event.kind.as_str(), "ExperimentEnd" | "ExperimentCancelled") {
-                        sidecar.ended_at_timestamp_ns = Some(event.timestamp_ns);
-                    }
-                    sidecar.events.push(event);
-                }
-                *path = sidecar.write_atomic(&recording_directory)?;
-                Ok(())
-            };
-            loop {
-                let now_ns = runtime_status
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .now_ns;
-                while let Ok(control) = control_rx.try_recv() {
-                    let events = match control {
-                        experiment::Control::Start => {
-                            if engine.snapshot().status == experiment::Status::Ready {
-                                engine.start(now_ns)?
-                            } else {
-                                Vec::new()
-                            }
-                        }
-                        experiment::Control::PauseResume => {
-                            if engine.snapshot().status == experiment::Status::Paused {
-                                vec![engine.resume(now_ns)?]
-                            } else if matches!(
-                                engine.snapshot().status,
-                                experiment::Status::Preparation
-                                    | experiment::Status::Baseline
-                                    | experiment::Status::Cue
-                                    | experiment::Status::Task
-                                    | experiment::Status::Rest
-                            ) {
-                                vec![engine.pause(now_ns)?]
-                            } else {
-                                Vec::new()
-                            }
-                        }
-                        experiment::Control::Cancel(reason) => {
-                            if matches!(
-                                engine.snapshot().status,
-                                experiment::Status::Completed
-                                    | experiment::Status::Cancelled
-                                    | experiment::Status::Failed
-                            ) {
-                                Vec::new()
-                            } else {
-                                sidecar.cancellation_reason = Some(reason.clone());
-                                vec![engine.cancel(now_ns, &reason)?]
-                            }
-                        }
-                    };
-                    publish(events, &mut sidecar, &mut sidecar_path)?;
-                }
-                let events = engine.tick(now_ns);
-                if !events.is_empty() {
-                    publish(events, &mut sidecar, &mut sidecar_path)?;
-                }
-                let current = engine.snapshot();
-                *snapshot_worker
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = current.clone();
-                if matches!(
-                    current.status,
-                    experiment::Status::Completed | experiment::Status::Cancelled
-                ) {
-                    sidecar.status = match current.status {
-                        experiment::Status::Completed => "completed",
-                        _ => "cancelled",
-                    }
-                    .into();
-                    sidecar.write_atomic(&recording_directory)?;
-                    return Ok(sidecar_path);
-                }
-                if stop.load(Ordering::Relaxed) {
-                    let fatal = runtime_status
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .fatal_error
-                        .clone();
-                    if !matches!(current.status, experiment::Status::Ready) {
-                        let reason = fatal
-                            .as_deref()
-                            .unwrap_or("LEMON stopped before protocol completion");
-                        sidecar.cancellation_reason = Some(reason.to_string());
-                        if let Ok(event) = engine.cancel(now_ns, reason) {
-                            publish(vec![event], &mut sidecar, &mut sidecar_path)?;
-                        }
-                    }
-                    sidecar.status = if fatal.is_some() {
-                        "failed"
-                    } else {
-                        "cancelled"
-                    }
-                    .into();
-                    sidecar.ended_at_timestamp_ns = Some(now_ns);
-                    sidecar.write_atomic(&recording_directory)?;
-                    return Ok(sidecar_path);
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        })();
-        if result.is_err() {
-            snapshot_worker
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .status = experiment::Status::Failed;
-            stop.store(true, Ordering::Relaxed);
-        }
-        result
-    });
-    Ok((ui, worker))
-}
-
-fn plugin_command(cli: &Cli) -> Result<()> {
-    let mut platform = plugins::Platform::open_default().map_err(|e| e.to_string())?;
-    match cli.command.as_ref() {
-        Some(Action::Plugins { command }) => match command {
-            cli::PluginsAction::Add { plugin_dir } => {
-                let info = platform.add(plugin_dir).map_err(|e| e.to_string())?;
-                print_plugin(&info);
-            }
-            cli::PluginsAction::List => {
-                let list = platform.list();
-                if list.is_empty() {
-                    println!("No plugins registered");
-                }
-                for info in list {
-                    print_plugin(&info);
-                }
-            }
-            cli::PluginsAction::Inspect { plugin_id_or_dir } => {
-                let info = platform
-                    .inspect(plugin_id_or_dir)
-                    .map_err(|e| e.to_string())?;
-                print_plugin(&info);
-                if let Some(manifest) = info.manifest {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?
-                    );
-                }
-            }
-            cli::PluginsAction::Remove { plugin_id } => {
-                platform.remove(plugin_id).map_err(|e| e.to_string())?;
-                println!("Removed {plugin_id} from the registry; plugin files were not deleted");
-            }
-            cli::PluginsAction::Enable { plugin_id } => print_plugin(
-                &platform
-                    .set_enabled(plugin_id, true)
-                    .map_err(|e| e.to_string())?,
-            ),
-            cli::PluginsAction::Disable { plugin_id } => print_plugin(
-                &platform
-                    .set_enabled(plugin_id, false)
-                    .map_err(|e| e.to_string())?,
-            ),
-        },
-        Some(Action::Plugin { command }) => match command {
-            cli::PluginAction::Run {
-                plugin_id_or_dir,
-                input,
-                output,
-                overwrite,
-                timeout,
-            } => {
-                let config = cli
-                    .config
-                    .clone()
-                    .ok_or("plugin run: --config CONFIG_JSON is required")?;
-                let report = platform
-                    .run(&plugins::RunOptions {
-                        plugin: plugin_id_or_dir.clone(),
-                        input: input.clone(),
-                        config,
-                        output: output.clone(),
-                        overwrite: *overwrite,
-                        timeout: Duration::from_secs(*timeout),
-                    })
-                    .map_err(|e| e.to_string())?;
-                println!(
-                    "Plugin {} {}: {}",
-                    report.manifest.id, report.manifest.version, report.result.status
-                );
-                for warning in &report.result.warnings {
-                    println!("Warning: {warning}");
-                }
-                for artifact in &report.result.artifacts {
-                    println!(
-                        "{}: {} — {}",
-                        artifact.kind,
-                        report.output.join(&artifact.path).display(),
-                        artifact.description
-                    );
-                }
-            }
-        },
-        _ => return Err("plugin command dispatch error".into()),
-    }
-    Ok(())
-}
-
-fn print_plugin(info: &plugins::PluginInfo) {
-    let (name, version, api) =
-        info.manifest
-            .as_ref()
-            .map_or((info.id.as_str(), "?", "?".into()), |m| {
-                (
-                    m.display_name.as_str(),
-                    m.version.as_str(),
-                    m.api_version.to_string(),
-                )
-            });
-    println!(
-        "{} ({}) v{} | API {} | {}\n  {}{}",
-        name,
-        info.id,
-        version,
-        api,
-        info.state,
-        info.path.display(),
-        info.reason
-            .as_ref()
-            .map(|r| format!("\n  {r}"))
-            .unwrap_or_default()
-    );
-}
 fn print_import(path: &Path) -> Result<()> {
-    if let Some(p) = storage::read_metadata(path)?.provenance {
-        for file in p.files_used {
+    if let Some(provenance) = storage::read_metadata(path)?.provenance {
+        for file in provenance.files_used {
             eprintln!("Import file: {file}");
         }
-        for file in p.duplicate_files_ignored {
+        for file in provenance.duplicate_files_ignored {
             eprintln!("Exact duplicate ignored: {file}");
         }
-        for warning in p.import_warnings {
+        for warning in provenance.import_warnings {
             eprintln!("Import warning: {warning}");
         }
     }
     Ok(())
-}
-fn config_command(command: &ConfigAction, cli: &Cli) -> Result<()> {
-    match command {
-        ConfigAction::Init { path, user } => {
-            let path = match path {
-                Some(path) => path.clone(),
-                None if *user => cli::settings_path(cli)?,
-                None => cli::user_directory()?.join("config.json"),
-            };
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-            }
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|e| {
-                    format!(
-                        "{}: {e}; выберите новый путь, существующие файлы не перезаписываются",
-                        path.display()
-                    )
-                })?;
-            if *user {
-                serde_json::to_writer_pretty(&file, &Settings::default())
-            } else {
-                serde_json::to_writer_pretty(&file, &Config::default())
-            }
-            .map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-            println!("Created {}", path.display());
-        }
-        ConfigAction::Check { path, user } => {
-            if *user {
-                Settings::load(path)?
-                    .ok_or_else(|| format!("Settings {} not found", path.display()))?;
-            } else {
-                cli::read_config(path)?.validate()?;
-            }
-            println!("OK: {}", path.display());
-        }
-    }
-    Ok(())
-}
-struct Logger {
-    level: LogLevel,
-    file: Option<fs::File>,
-    headless: bool,
-}
-impl Logger {
-    fn new(level: LogLevel, headless: bool, settings_path: &Path) -> Result<Self> {
-        let file = if !headless && level != LogLevel::Off {
-            let parent = settings_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            fs::create_dir_all(parent).map_err(|e| format!("Log directory: {e}"))?;
-            Some(
-                fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(parent.join("lemon.log"))
-                    .map_err(|e| format!("Log file: {e}"))?,
-            )
-        } else {
-            None
-        };
-        Ok(Self {
-            level,
-            file,
-            headless,
-        })
-    }
-    fn write(&mut self, level: LogLevel, text: &str) {
-        if self.level == LogLevel::Off || level > self.level {
-            return;
-        }
-        if self.headless {
-            eprintln!("[{level:?}] {text}");
-        } else if let Some(file) = &mut self.file {
-            let _ = writeln!(file, "[{level:?}] {text}");
-        }
-    }
-}
-
-struct ReportTemp(PathBuf);
-impl ReportTemp {
-    fn new() -> Result<Self> {
-        for n in 0..10000 {
-            let path =
-                std::env::temp_dir().join(format!("lemon-report-{}-{n}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        Err("report: cannot allocate temporary directory".into())
-    }
-}
-impl Drop for ReportTemp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }

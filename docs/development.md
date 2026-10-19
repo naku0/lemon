@@ -23,6 +23,39 @@ which lemon
 lemon --version
 ```
 
+## Где искать код
+
+Начинайте с crate, который владеет нужным поведением:
+
+| Задача | Основное место |
+|---|---|
+| Типы конфигурации и сигнала | `crates/core` |
+| Serial, CSV/tagged-u8 и replay source | `crates/source` |
+| Фильтры, PSD, quality и окна | `crates/processing` |
+| Raw session, импорт DAT/DMOV/CSV | `crates/storage` |
+| AnalysisBundle | `crates/analysis` |
+| Protocol и trial state machine | `crates/experiment` |
+| Offline study | `crates/study` |
+| Реестр и запуск плагинов | `crates/plugins` |
+| Публичное чтение bundle для плагинов | `crates/lemon-plugin-sdk` |
+| Notebook и portable report | `crates/report` |
+| Отрисовка и ввод терминала | `crates/tui` |
+| CLI и связывание режимов | `crates/app` |
+
+В `crates/app/src/main.rs` остаётся общий сценарий запуска. Отдельные области вынесены
+в `experiment_controller.rs`, `plugin_commands.rs`, `config_commands.rs`,
+`report_support.rs` и `logging.rs`. Бизнес-правила должны оставаться в своих crates:
+CLI-модули только переводят аргументы пользователя в их публичные интерфейсы.
+
+Для поиска причины ошибки двигайтесь по потоку данных:
+
+```text
+source → storage Raw → processing → analysis → report/plugin
+```
+
+Experiment добавляет события в существующую запись, а study вызывает готовый
+import/analyze pipeline для нескольких независимых источников.
+
 ## Полный набор проверок
 
 ```bash
