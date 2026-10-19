@@ -2,6 +2,14 @@
 
 ## Первый запуск рабочего дерева
 
+Проект использует закреплённый Rust toolchain из `rust-toolchain.toml`.
+Cargo и rustup автоматически выберут `1.99.0`; проверить активную версию можно так:
+
+```bash
+rustc --version
+cargo --version
+```
+
 ```bash
 git status --short
 cargo build --locked
