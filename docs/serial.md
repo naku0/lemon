@@ -43,7 +43,7 @@ lemon probe \
 Профиль для полного кадра `A0…A7,A9`, выбранных сигналов A0/A1 и счётчика A9 находится в `examples/serial-tagged-u8-a0.json`:
 
 ```bash
-lemon live \
+lemon run live \
   --config examples/serial-tagged-u8-a0.json \
   --port /dev/cu.usbmodem1401 \
   --record
@@ -82,7 +82,7 @@ lemon live \
 Для строк `123.5` или `123.5,-42`:
 
 ```bash
-lemon live \
+lemon run live \
   --port PORT \
   --baud 115200 \
   --protocol csv \

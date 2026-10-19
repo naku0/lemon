@@ -1,17 +1,26 @@
 //! Streaming, TUI-independent analysis of a native or externally imported session.
 //! The processor and all spectral calculations are the same implementation used by live/replay.
 use core_types::{ChannelSamples, Config, RawSignalBlock, SignalFlag, SignalQuality};
-use processing::Processor;
-use serde::{Deserialize, Serialize};
+use processing::{
+    windows::{AnalysisSample, WindowCandidate, WindowGenerator, WindowingConfig},
+    Processor,
+};
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File},
-    hash::{Hash, Hasher},
-    io::Read,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 use storage::{external, Metadata, SessionReader};
+
+mod bundle;
+mod output;
+mod provenance;
+
+pub use bundle::{AnalysisBundle, BandSummary, ChannelSummary, QualityCount, Summary};
+use output::OutputTransaction;
+use provenance::{hash_path, source_format, source_hashes};
 
 pub type AnalysisError = String;
 #[derive(Debug, Clone)]
@@ -26,52 +35,6 @@ pub struct AnalysisOptions {
     pub units: Option<String>,
     pub overwrite: bool,
     pub import: external::Options,
-}
-#[derive(Debug, Clone)]
-pub struct AnalysisBundle {
-    pub directory: PathBuf,
-    pub summary: Summary,
-}
-impl AnalysisBundle {
-    pub fn open(directory: impl Into<PathBuf>) -> Result<Self, AnalysisError> {
-        let directory = directory.into();
-        for name in ["manifest.json", "summary.json"] {
-            let path = directory.join(name);
-            if fs::metadata(&path)
-                .map_err(|e| format!("analysis/open {}: {e}", path.display()))?
-                .len()
-                > 4 * 1024 * 1024
-            {
-                return Err(format!(
-                    "analysis/open {}: JSON exceeds 4 MiB",
-                    path.display()
-                ));
-            }
-        }
-        let manifest: serde_json::Value = serde_json::from_reader(
-            File::open(directory.join("manifest.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        if manifest["analysis_format_version"].as_u64() != Some(1) {
-            return Err("analysis/open: unsupported analysis_format_version".into());
-        }
-        let summary: Summary = serde_json::from_reader(
-            File::open(directory.join("summary.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        for name in [
-            "manifest.json",
-            "processed.csv",
-            "spectrum.csv",
-            "band-power.csv",
-            "quality-events.csv",
-        ] {
-            if !directory.join(name).is_file() {
-                return Err(format!("analysis: missing {name}"));
-            }
-        }
-        Ok(Self { directory, summary })
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -103,7 +66,17 @@ struct Manifest {
     analysis_warnings: Vec<String>,
     output_files: Vec<String>,
     psd_units: String,
+    dsp_algorithm_version: u32,
+    windowing_algorithm_version: u32,
+    psd_algorithm_version: u32,
+    processing_mode: String,
+    window_function: core_types::WindowFunction,
+    filter_warmup_seconds: f64,
+    artifact_policy: core_types::ArtifactPolicy,
+    reject_low_quality_windows: bool,
+    window_exclusion_flags: Vec<String>,
 }
+
 #[derive(Debug, Serialize)]
 struct SpectralConfig {
     window_samples: usize,
@@ -111,62 +84,6 @@ struct SpectralConfig {
     window: String,
     aggregation: String,
 }
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct QualityCount {
-    pub count: u64,
-    pub fraction: f64,
-}
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BandSummary {
-    pub low_hz: f64,
-    pub high_hz: f64,
-    pub mean_absolute_power: f64,
-    pub median_absolute_power: Option<f64>,
-    pub mean_relative_power: f64,
-    pub median_relative_power: Option<f64>,
-    pub min_relative_power: f64,
-    pub max_relative_power: f64,
-    pub mean_baseline_change_pct: Option<f64>,
-    pub valid_window_count: u64,
-}
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ChannelSummary {
-    pub raw_min: f64,
-    pub raw_max: f64,
-    pub raw_mean: f64,
-    pub raw_stddev: f64,
-    pub filtered_min: Option<f64>,
-    pub filtered_max: Option<f64>,
-    pub filtered_mean: Option<f64>,
-    pub filtered_stddev: Option<f64>,
-    pub quality_distribution: BTreeMap<String, QualityCount>,
-    pub dominant_peak_frequency_hz: Option<f64>,
-    pub dominant_peak_power: Option<f64>,
-    pub mains_power_before: f64,
-    pub mains_power_after: f64,
-    pub mains_reduction_percent: Option<f64>,
-    pub band_statistics: BTreeMap<String, BandSummary>,
-}
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Summary {
-    pub duration_seconds: f64,
-    pub channel_count: usize,
-    pub sample_count_by_channel: BTreeMap<String, u64>,
-    pub valid_filtered_count_by_channel: BTreeMap<String, u64>,
-    pub missing_count_by_channel: BTreeMap<String, u64>,
-    pub lost_sample_count: u64,
-    pub invalid_packet_count: u64,
-    pub outlier_count: u64,
-    pub saturation_count: u64,
-    pub disconnection_count: u64,
-    pub continuous_segment_count: u64,
-    pub sample_rate_hz: f64,
-    pub sample_rate_source: String,
-    pub channels: BTreeMap<String, ChannelSummary>,
-    pub warnings: Vec<String>,
-    pub dominant_band_by_channel: BTreeMap<String, String>,
-}
-
 #[derive(Default, Clone)]
 struct Running {
     n: u64,
@@ -238,7 +155,174 @@ struct ChAgg {
     previous_flags: Vec<SignalFlag>,
     source: String,
     force_reset: bool,
-    window_times: VecDeque<u64>,
+    raw_window: VecDeque<f64>,
+    smoothed: BTreeMap<String, f64>,
+    excluded_windows: u64,
+    exclusion_reasons: BTreeMap<String, u64>,
+    last_sample_valid: Option<bool>,
+    last_segment_id: Option<u64>,
+}
+#[allow(clippy::too_many_arguments)]
+fn write_candidate(
+    candidate: WindowCandidate,
+    channel: &mut ChAgg,
+    config: &Config,
+    channel_index: usize,
+    spectrum: &mut csv::Writer<File>,
+    bands: &mut csv::Writer<File>,
+    excluded: &mut csv::Writer<File>,
+) -> Result<(), String> {
+    match candidate {
+        WindowCandidate::Rejected {
+            index,
+            segment_id,
+            start_timestamp_ns,
+            end_timestamp_ns,
+            available_samples,
+            reasons,
+        } => {
+            let codes = reasons
+                .iter()
+                .map(|reason| reason.code())
+                .collect::<Vec<_>>()
+                .join("|");
+            excluded
+                .write_record([
+                    channel.id.clone(),
+                    segment_id.map(|id| id.to_string()).unwrap_or_default(),
+                    index.to_string(),
+                    start_timestamp_ns.to_string(),
+                    end_timestamp_ns.to_string(),
+                    codes,
+                    format!("{available_samples} available samples"),
+                ])
+                .map_err(|error| error.to_string())?;
+            channel.excluded_windows += 1;
+            for reason in reasons {
+                *channel
+                    .exclusion_reasons
+                    .entry(reason.code().into())
+                    .or_default() += 1;
+            }
+        }
+        WindowCandidate::Accepted {
+            index,
+            segment_id,
+            start_timestamp_ns,
+            end_timestamp_ns,
+            samples,
+        } => {
+            let values = samples
+                .iter()
+                .map(|sample| {
+                    sample
+                        .value
+                        .ok_or("analysis: accepted sample missing value")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let filtered = processing::one_sided_psd(
+                &values,
+                config.source.sample_rate_hz,
+                config.processing.window_function,
+            )?;
+            let raw = processing::one_sided_psd(
+                &channel.raw_window.iter().copied().collect::<Vec<_>>(),
+                config.source.sample_rate_hz,
+                config.processing.window_function,
+            )?;
+            if raw.values.len() != filtered.values.len() {
+                return Err("analysis: raw/filtered window mismatch".into());
+            }
+            for (k, frequency) in filtered.frequencies_hz.iter().enumerate() {
+                spectrum
+                    .write_record([
+                        index.to_string(),
+                        start_timestamp_ns.to_string(),
+                        end_timestamp_ns.to_string(),
+                        channel.id.clone(),
+                        segment_id.to_string(),
+                        frequency.to_string(),
+                        raw.values[k].to_string(),
+                        filtered.values[k].to_string(),
+                        window_name(config.processing.window_function).into(),
+                        samples.len().to_string(),
+                        filtered.resolution_hz.to_string(),
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
+            if channel.mean_psd.is_empty() {
+                channel.mean_psd.resize(filtered.values.len(), 0.0);
+            }
+            for (mean, value) in channel.mean_psd.iter_mut().zip(&filtered.values) {
+                *mean += (value - *mean) / (channel.windows + 1) as f64;
+            }
+            let mains = |psd: &processing::PsdResult| {
+                psd.frequencies_hz
+                    .iter()
+                    .zip(&psd.values)
+                    .filter(|(frequency, _)| {
+                        (**frequency - config.processing.notch_hz).abs() <= 2.0
+                    })
+                    .map(|(_, power)| power * psd.resolution_hz)
+                    .sum::<f64>()
+            };
+            channel.mains_before.add(mains(&raw));
+            channel.mains_after.add(mains(&filtered));
+            let total = filtered.values.iter().skip(1).sum::<f64>() * filtered.resolution_hz;
+            let quality = if samples
+                .iter()
+                .any(|sample| sample.flags.contains(&SignalFlag::LowQuality))
+            {
+                "Acceptable"
+            } else {
+                "Good"
+            };
+            for (i, band) in config.processing.bands.iter().enumerate() {
+                let absolute =
+                    processing::integrate_band_power(&filtered, band.low_hz, band.high_hz)?;
+                let relative = if total > 0.0 { absolute / total } else { 0.0 };
+                let smoothed = channel
+                    .smoothed
+                    .get(&band.name)
+                    .map_or(absolute, |previous| {
+                        config.processing.smoothing * absolute
+                            + (1.0 - config.processing.smoothing) * previous
+                    });
+                channel.smoothed.insert(band.name.clone(), smoothed);
+                let baseline = config
+                    .processing
+                    .baseline
+                    .get(channel_index)
+                    .and_then(|values| values.get(i))
+                    .map(|base| (absolute / base - 1.0) * 100.0);
+                bands
+                    .write_record([
+                        index.to_string(),
+                        start_timestamp_ns.to_string(),
+                        end_timestamp_ns.to_string(),
+                        channel.id.clone(),
+                        segment_id.to_string(),
+                        band.name.clone(),
+                        band.low_hz.to_string(),
+                        band.high_hz.to_string(),
+                        absolute.to_string(),
+                        relative.to_string(),
+                        smoothed.to_string(),
+                        baseline.map(|value| value.to_string()).unwrap_or_default(),
+                        quality.into(),
+                    ])
+                    .map_err(|error| error.to_string())?;
+                let aggregation = channel.bands.entry(band.name.clone()).or_default();
+                aggregation.abs.add(absolute);
+                aggregation.rel.add(relative);
+                if let Some(value) = baseline {
+                    aggregation.base.add(value);
+                }
+            }
+            channel.windows += 1;
+        }
+    }
+    Ok(())
 }
 #[derive(Default, Clone, Copy)]
 struct FlagCounts {
@@ -261,6 +345,7 @@ fn flag_name(f: SignalFlag) -> &'static str {
         SignalFlag::LowQuality => "LowQuality",
         SignalFlag::ChannelMismatch => "ChannelMismatch",
         SignalFlag::InsufficientData => "InsufficientData",
+        SignalFlag::FilterWarmup => "FilterWarmup",
     }
 }
 fn flag_text(flags: &[SignalFlag]) -> String {
@@ -270,51 +355,10 @@ fn flag_text(flags: &[SignalFlag]) -> String {
         .collect::<Vec<_>>()
         .join("|")
 }
-fn source_hashes(input: &Path, meta: &Metadata) -> Result<BTreeMap<String, String>, String> {
-    let files = if input.is_dir() && input.join("metadata.json").is_file() {
-        ["metadata.json", "raw.csv", "events.csv"]
-            .iter()
-            .map(|n| input.join(n))
-            .collect::<Vec<_>>()
-    } else if let Some(p) = &meta.provenance {
-        p.files_used.iter().map(PathBuf::from).collect()
-    } else {
-        vec![input.to_path_buf()]
-    };
-    files
-        .iter()
-        .map(|p| Ok((p.display().to_string(), hash_path(p)?)))
-        .collect()
-}
-fn hash_path(path: &Path) -> Result<String, AnalysisError> {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut files = Vec::new();
-    if path.is_dir() {
-        for e in fs::read_dir(path).map_err(|e| format!("analyze/hash {}: {e}", path.display()))? {
-            let p = e.map_err(|e| e.to_string())?.path();
-            if p.is_file() {
-                files.push(p)
-            }
-        }
-        files.sort();
-    } else {
-        files.push(path.to_path_buf());
+fn window_name(window: core_types::WindowFunction) -> &'static str {
+    match window {
+        core_types::WindowFunction::HannSymmetric => "hann_symmetric",
     }
-    for p in files {
-        p.file_name().hash(&mut h);
-        let mut f = File::open(&p).map_err(|e| format!("analyze/hash {}: {e}", p.display()))?;
-        let mut b = [0u8; 8192];
-        loop {
-            let n = f
-                .read(&mut b)
-                .map_err(|e| format!("analyze/hash {}: {e}", p.display()))?;
-            if n == 0 {
-                break;
-            }
-            h.write(&b[..n]);
-        }
-    }
-    Ok(format!("{:016x}", h.finish()))
 }
 fn split_block(block: RawSignalBlock, size: usize) -> Vec<RawSignalBlock> {
     let max = block
@@ -356,12 +400,6 @@ fn split_block(block: RawSignalBlock, size: usize) -> Vec<RawSignalBlock> {
         })
         .collect()
 }
-fn source_format(meta: &Metadata) -> String {
-    meta.provenance
-        .as_ref()
-        .map(|p| p.original_format.clone())
-        .unwrap_or_else(|| "lemon-session".into())
-}
 pub fn analyze(
     input: AnalysisInput,
     options: AnalysisOptions,
@@ -402,10 +440,20 @@ pub fn analyze(
     config
         .validate()
         .map_err(|e| format!("analyze/DSP {}: {e}", input.path.display()))?;
-    let output = make_output(&input.path, &options, &meta)?;
-    validate_output(&input.path, &output, options.overwrite)?;
-    let staging = Staging::new(&output)?;
-    let temp = &staging.0;
+    let output = OutputTransaction::new(&input.path, &options, &meta)?;
+    let temp = output.staging_directory();
+    let experiment_sidecar = input.path.join("experiment.json");
+    let has_experiment = experiment_sidecar.is_file();
+    if has_experiment {
+        let bytes = fs::read(&experiment_sidecar)
+            .map_err(|e| format!("analyze/experiment {}: {e}", experiment_sidecar.display()))?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("analyze/experiment: sidecar exceeds 4 MiB".into());
+        }
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| format!("analyze/experiment: invalid JSON: {e}"))?;
+        fs::write(temp.join("experiment.json"), bytes).map_err(|e| e.to_string())?;
+    }
     let mut processed =
         csv::Writer::from_path(temp.join("processed.csv")).map_err(|e| e.to_string())?;
     processed
@@ -415,6 +463,10 @@ pub fn analyze(
             "channel",
             "raw",
             "filtered",
+            "segment_id",
+            "sample_valid",
+            "filter_warmup",
+            "artifact_rejected",
             "quality",
             "flags",
         ])
@@ -427,9 +479,13 @@ pub fn analyze(
             "window_start_ns",
             "window_end_ns",
             "channel",
+            "segment_id",
             "frequency_hz",
             "raw_psd",
             "filtered_psd",
+            "window_function",
+            "sample_count",
+            "frequency_resolution_hz",
         ])
         .map_err(|e| e.to_string())?;
     let mut bands =
@@ -440,6 +496,7 @@ pub fn analyze(
             "window_start_ns",
             "window_end_ns",
             "channel",
+            "segment_id",
             "band",
             "low_hz",
             "high_hz",
@@ -447,6 +504,7 @@ pub fn analyze(
             "relative",
             "smoothed",
             "baseline_change_pct",
+            "quality_status",
         ])
         .map_err(|e| e.to_string())?;
     let mut quality =
@@ -454,10 +512,22 @@ pub fn analyze(
     quality
         .write_record(["timestamp_ns", "channel", "kind", "severity", "details"])
         .map_err(|e| e.to_string())?;
+    let mut excluded =
+        csv::Writer::from_path(temp.join("excluded-windows.csv")).map_err(|e| e.to_string())?;
+    excluded
+        .write_record([
+            "channel",
+            "segment_id",
+            "window_index",
+            "window_start_ns",
+            "window_end_ns",
+            "reason_codes",
+            "details",
+        ])
+        .map_err(|e| e.to_string())?;
     let mut reader = SessionReader::open(&session)?;
-    // A separate existing Processor per channel exposes every frame, including an
-    // asynchronous channel's startup/tail. Baselines keep their original channel index.
-    let mut channel_configs = Vec::new();
+    // A separate Processor preserves independent channel filter and warmup state.
+    // The shared window generator consumes its processed samples below.
     let mut processors = Vec::new();
     for ci in 0..config.source.channels {
         let mut one = config.clone();
@@ -470,13 +540,20 @@ pub fn analyze(
             .into_iter()
             .collect();
         processors.push(Processor::new(&one)?);
-        channel_configs.push(one);
     }
     let mut agg: Vec<ChAgg> = (0..config.source.channels)
         .map(|_| ChAgg::default())
         .collect();
     let mut last_time = 0;
-    let mut window_index = 0u64;
+    let mut windowing = WindowingConfig::new(
+        config.processing.window_samples,
+        config.processing.hop_samples,
+        config.source.sample_rate_hz,
+    );
+    windowing.reject_low_quality = config.processing.reject_low_quality_windows;
+    let mut generators = (0..config.source.channels)
+        .map(|_| WindowGenerator::new(windowing.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut processor_sequence = 0u64;
     let mut previous_block: Option<u64> = None;
     let mut first_time: Option<u64> = None;
@@ -530,35 +607,10 @@ pub fn analyze(
                     continue;
                 }
                 let sample = &channel.samples[0];
-                let invalid_order = agg[ci]
-                    .previous_sequence
-                    .is_some_and(|n| sample.sequence <= n)
-                    || agg[ci]
-                        .previous_time
-                        .is_some_and(|t| sample.timestamp_ns <= t);
-                let boundary = agg[ci].force_reset
+                if agg[ci].force_reset
                     || (!agg[ci].source.is_empty() && agg[ci].source != part.source)
-                    || sample.flags.iter().chain(part.flags.iter()).any(|f| {
-                        matches!(
-                            f,
-                            SignalFlag::LostSample
-                                | SignalFlag::InvalidPacket
-                                | SignalFlag::Disconnected
-                        )
-                    })
-                    || agg[ci].previous_time.is_some_and(|t| {
-                        sample.timestamp_ns.saturating_sub(t) as f64
-                            > 1.5e9 / config.source.sample_rate_hz
-                    })
-                    || agg[ci]
-                        .previous_sequence
-                        .is_some_and(|n| sample.sequence != n.saturating_add(1));
-                let starts_segment = agg[ci].previous_time.is_none() || boundary;
-                if boundary {
-                    agg[ci].window_times.clear();
-                }
-                if boundary && !invalid_order {
-                    processors[ci] = Processor::new(&channel_configs[ci])?;
+                {
+                    processors[ci].reset_after_continuity_break();
                 }
                 agg[ci].source = part.source.clone();
                 agg[ci].force_reset = false;
@@ -567,9 +619,6 @@ pub fn analyze(
                 one.sequence = agg[ci].samples;
                 one.synchronized_clock = true;
                 let mut out = processors[ci].process(one)?;
-                if boundary && !out.flags.contains(&SignalFlag::LostSample) {
-                    out.flags.push(SignalFlag::LostSample);
-                }
                 let mismatch = config.source.channels == 2
                     && (!part.synchronized_clock
                         || part.channels.iter().any(|ch| ch.samples.is_empty())
@@ -583,7 +632,6 @@ pub fn analyze(
                             }));
                 if mismatch {
                     out.flags.push(SignalFlag::ChannelMismatch);
-                    out.channel_quality.fill(SignalQuality::Poor);
                 }
                 agg[ci].previous_time = Some(sample.timestamp_ns);
 
@@ -602,12 +650,12 @@ pub fn analyze(
                 for ch in &out.raw_channels {
                     agg[ci].id = ch.id.clone();
                     let filtered = out.filtered_channels.first();
+                    let sample_metadata = out.sample_metadata.first();
                     let q = out
                         .channel_quality
                         .first()
                         .copied()
                         .unwrap_or(SignalQuality::Unknown);
-                    let flags = flag_text(&out.flags);
                     for (i, s) in ch.samples.iter().enumerate() {
                         first_time =
                             Some(first_time.map_or(s.timestamp_ns, |t| t.min(s.timestamp_ns)));
@@ -618,6 +666,29 @@ pub fn analyze(
                         }
                         agg[ci].previous_sequence = Some(s.sequence);
                         let fv = filtered.and_then(|f| f.samples.get(i)).copied().flatten();
+                        let state = sample_metadata.and_then(|items| items.get(i));
+                        let segment_id = state.map_or(0, |item| item.segment_id);
+                        if agg[ci].last_segment_id != Some(segment_id) {
+                            agg[ci].smoothed.clear();
+                            agg[ci].segments += 1;
+                            segments += 1;
+                            agg[ci].last_segment_id = Some(segment_id);
+                            quality
+                                .write_record([
+                                    s.timestamp_ns.to_string(),
+                                    ch.id.clone(),
+                                    "SegmentStart".into(),
+                                    "info".into(),
+                                    format!("continuous channel segment {segment_id}"),
+                                ])
+                                .map_err(|e| e.to_string())?;
+                        }
+                        let sample_valid = state.is_some_and(|item| item.sample_valid);
+                        let filter_warmup = state.is_some_and(|item| item.filter_warmup);
+                        let artifact_rejected = state.is_some_and(|item| item.artifact_rejected);
+                        let sample_flags = state
+                            .map(|item| flag_text(&item.flags))
+                            .unwrap_or_else(|| flag_text(&out.flags));
                         processed
                             .write_record([
                                 s.timestamp_ns.to_string(),
@@ -625,36 +696,48 @@ pub fn analyze(
                                 ch.id.clone(),
                                 s.value.to_string(),
                                 fv.map(|v| v.to_string()).unwrap_or_default(),
+                                segment_id.to_string(),
+                                sample_valid.to_string(),
+                                filter_warmup.to_string(),
+                                artifact_rejected.to_string(),
                                 qname(q),
-                                flags.clone(),
+                                sample_flags.clone(),
                             ])
                             .map_err(|e| e.to_string())?;
                         agg[ci].samples += 1;
                         agg[ci].raw.add(s.value);
                         if let Some(v) = fv {
                             agg[ci].filtered.add(v);
-                            agg[ci].window_times.push_back(s.timestamp_ns);
-                            if agg[ci].window_times.len() > config.processing.window_samples {
-                                agg[ci].window_times.pop_front();
-                            }
-                        } else {
-                            agg[ci].window_times.clear();
                         }
+                        if !sample_valid || agg[ci].last_sample_valid == Some(false) {
+                            agg[ci].smoothed.clear();
+                        }
+                        agg[ci].raw_window.push_back(s.value);
+                        if agg[ci].raw_window.len() > config.processing.window_samples {
+                            agg[ci].raw_window.pop_front();
+                        }
+                        let candidates = generators[ci].push(AnalysisSample {
+                            sequence: s.sequence,
+                            timestamp_ns: s.timestamp_ns,
+                            segment_id,
+                            value: fv,
+                            eligible: sample_valid,
+                            flags: state.map(|item| item.flags.clone()).unwrap_or_default(),
+                        });
+                        for candidate in candidates {
+                            write_candidate(
+                                candidate,
+                                &mut agg[ci],
+                                &config,
+                                ci,
+                                &mut spectrum,
+                                &mut bands,
+                                &mut excluded,
+                            )?;
+                        }
+                        agg[ci].last_sample_valid = Some(sample_valid);
                     }
                     *agg[ci].quality.entry(qname(q)).or_default() += ch.samples.len() as u64;
-                    if starts_segment {
-                        agg[ci].segments += 1;
-                        segments += 1;
-                        quality
-                            .write_record([
-                                sample.timestamp_ns.to_string(),
-                                ch.id.clone(),
-                                "SegmentStart".into(),
-                                "info".into(),
-                                "continuous channel segment".into(),
-                            ])
-                            .map_err(|e| e.to_string())?;
-                    }
                     for f in out
                         .flags
                         .iter()
@@ -678,99 +761,20 @@ pub fn analyze(
                     }
                 }
                 agg[ci].previous_flags = out.flags.clone();
-                if let Some(sp) = &out.spectrum {
-                    let start = agg[ci].window_times.front().copied().ok_or_else(|| {
-                        "analyze/DSP: spectral frame has no sample timestamps".to_string()
-                    })?;
-                    for csp in &sp.channels {
-                        for (k, freq) in sp.frequencies.iter().enumerate() {
-                            spectrum
-                                .write_record([
-                                    agg[ci].windows.to_string(),
-                                    start.to_string(),
-                                    sp.timestamp_ns.to_string(),
-                                    csp.channel.clone(),
-                                    freq.to_string(),
-                                    csp.raw_psd.get(k).unwrap_or(&0.).to_string(),
-                                    csp.filtered_psd.get(k).unwrap_or(&0.).to_string(),
-                                ])
-                                .map_err(|e| e.to_string())?;
-                        }
-                        if agg[ci].mean_psd.is_empty() {
-                            agg[ci].mean_psd.resize(csp.filtered_psd.len(), 0.);
-                        }
-                        let count = (agg[ci].windows + 1) as f64;
-                        for (mean, value) in agg[ci].mean_psd.iter_mut().zip(&csp.filtered_psd) {
-                            *mean += (value - *mean) / count;
-                        }
-                        agg[ci].mains_before.add(
-                            csp.raw_psd
-                                .iter()
-                                .enumerate()
-                                .filter(|(k, _)| {
-                                    (*k as f64 * config.source.sample_rate_hz
-                                        / config.processing.window_samples as f64
-                                        - config.processing.notch_hz)
-                                        .abs()
-                                        <= 2.
-                                })
-                                .map(|(_, v)| *v)
-                                .sum::<f64>()
-                                * config.source.sample_rate_hz
-                                / config.processing.window_samples as f64,
-                        );
-                        agg[ci].mains_after.add(
-                            csp.filtered_psd
-                                .iter()
-                                .enumerate()
-                                .filter(|(k, _)| {
-                                    (*k as f64 * config.source.sample_rate_hz
-                                        / config.processing.window_samples as f64
-                                        - config.processing.notch_hz)
-                                        .abs()
-                                        <= 2.
-                                })
-                                .map(|(_, v)| *v)
-                                .sum::<f64>()
-                                * config.source.sample_rate_hz
-                                / config.processing.window_samples as f64,
-                        );
-                    }
-                    if let Some(bp) = &out.band_power {
-                        for b in bp {
-                            let ch = ci;
-                            let band = config.processing.bands.iter().find(|x| x.name == b.band);
-                            if let Some(band) = band {
-                                bands
-                                    .write_record([
-                                        agg[ci].windows.to_string(),
-                                        start.to_string(),
-                                        sp.timestamp_ns.to_string(),
-                                        b.channel.clone(),
-                                        b.band.clone(),
-                                        band.low_hz.to_string(),
-                                        band.high_hz.to_string(),
-                                        b.absolute.to_string(),
-                                        b.relative.to_string(),
-                                        b.smoothed.to_string(),
-                                        b.baseline_change_pct
-                                            .map(|v| v.to_string())
-                                            .unwrap_or_default(),
-                                    ])
-                                    .map_err(|e| e.to_string())?;
-                                let a = &mut agg[ch].bands.entry(b.band.clone()).or_default();
-                                a.abs.add(b.absolute);
-                                a.rel.add(b.relative);
-                                if let Some(v) = b.baseline_change_pct {
-                                    a.base.add(v);
-                                }
-                            }
-                        }
-                    }
-                    window_index += 1;
-                    agg[ci].windows += 1;
-                }
             }
+        }
+    }
+    for (ci, generator) in generators.iter_mut().enumerate() {
+        if let Some(candidate) = generator.finish() {
+            write_candidate(
+                candidate,
+                &mut agg[ci],
+                &config,
+                ci,
+                &mut spectrum,
+                &mut bands,
+                &mut excluded,
+            )?;
         }
     }
     let mut events = storage::EventReader::open(&session)?;
@@ -789,8 +793,9 @@ pub fn analyze(
     spectrum.flush().map_err(|e| e.to_string())?;
     bands.flush().map_err(|e| e.to_string())?;
     quality.flush().map_err(|e| e.to_string())?;
-    warnings.push("Quality uses one-sample blocks independently per channel; no channel asymmetry is reported. Exact band medians are null beyond 100000 windows. Complete spectral windows may contain artifacts; consult quality-events.csv.".into());
-    if window_index == 0 {
+    excluded.flush().map_err(|e| e.to_string())?;
+    warnings.push("Quality decisions use the same sample-wise processor in live, replay and analysis; no channel asymmetry is reported. Exact band medians are null beyond 100000 values. Spectral windows are emitted only after filter warmup and eligibility checks.".into());
+    if agg.iter().all(|channel| channel.windows == 0) {
         warnings.push("No complete spectral window was available; spectrum and band-power files contain headers only.".into());
     }
     let summary = build_summary(
@@ -799,12 +804,12 @@ pub fn analyze(
         last_time.saturating_sub(first_time.unwrap_or(last_time)),
         segments,
         flag_counts,
-        window_index,
+        agg.iter().map(|channel| channel.windows).sum(),
         sample_rate_source.clone(),
         &warnings,
     );
     let md = Manifest {
-        analysis_format_version: 1,
+        analysis_format_version: 2,
         lemon_version: env!("CARGO_PKG_VERSION").into(),
         created_at: format!(
             "unix-ms:{}",
@@ -817,7 +822,7 @@ pub fn analyze(
         source_path: input.path.display().to_string(),
         source_hash: hash_path(&input.path)?,
         source_hashes: source_hashes(&input.path, &meta)?,
-        statistics_basis: "quality: sample-weighted, one-sample Processor per channel; missing: sequence gaps; segments: summed per channel; complete windows include artifacts; medians exact up to 100000 values then null; stddev uses n-1".into(),
+        statistics_basis: "quality: sample-weighted, deterministic sample-wise Processor per channel; missing: sequence gaps; segments: summed per channel; spectra: eligible post-warmup windows only; medians exact up to 100000 values then null; stddev uses n-1".into(),
         mains_interval_hz: [config.processing.notch_hz - 2., config.processing.notch_hz + 2.],
         source_metadata: meta.clone(),
         channels: agg.iter().map(|a| a.id.clone()).collect(),
@@ -835,7 +840,7 @@ pub fn analyze(
         spectral_config: SpectralConfig {
             window_samples: config.processing.window_samples,
             hop_samples: config.processing.hop_samples,
-            window: "Hann".into(),
+            window: window_name(config.processing.window_function).into(),
             aggregation: "peak of mean filtered PSD over complete continuous windows; DC excluded; high-pass through low-pass".into(),
         },
         configured_bands: config.processing.bands.clone(),
@@ -851,7 +856,8 @@ pub fn analyze(
             .map(|p| p.time_normalization.clone())
             .unwrap_or_else(|| meta.timestamp_basis.clone()),
         analysis_warnings: warnings.clone(),
-        output_files: vec![
+        output_files: {
+            let mut files = vec![
             "manifest.json".to_string(),
             "summary.json".to_string(),
             "summary.md".to_string(),
@@ -859,8 +865,35 @@ pub fn analyze(
             "spectrum.csv".to_string(),
             "band-power.csv".to_string(),
             "quality-events.csv".to_string(),
-        ],
+            "excluded-windows.csv".to_string(),
+            ];
+            if has_experiment {
+                files.push("experiment.json".into());
+            }
+            files
+        },
         psd_units: "Processor PSD units (signal units squared/Hz)".into(),
+        dsp_algorithm_version: 3,
+        windowing_algorithm_version: processing::windows::WINDOWING_ALGORITHM_VERSION,
+        psd_algorithm_version: processing::PSD_ALGORITHM_VERSION,
+        processing_mode: "causal_live_compatible".into(),
+        window_function: config.processing.window_function,
+        filter_warmup_seconds: config.processing.filter_warmup_seconds,
+        artifact_policy: config.processing.artifact_policy,
+        reject_low_quality_windows: config.processing.reject_low_quality_windows,
+        window_exclusion_flags: [
+            SignalFlag::InvalidPacket,
+            SignalFlag::LostSample,
+            SignalFlag::Outlier,
+            SignalFlag::Saturation,
+            SignalFlag::Disconnected,
+            SignalFlag::FilterWarmup,
+            SignalFlag::LowQuality,
+        ]
+        .into_iter()
+        .filter(|flag| *flag != SignalFlag::LowQuality || config.processing.reject_low_quality_windows)
+        .map(|flag| flag_name(flag).to_string())
+        .collect(),
     };
     serde_json::to_writer_pretty(
         File::create(temp.join("manifest.json")).map_err(|e| e.to_string())?,
@@ -874,128 +907,8 @@ pub fn analyze(
     .map_err(|e| e.to_string())?;
     fs::write(temp.join("summary.md"), summary_markdown(&md, &summary))
         .map_err(|e| e.to_string())?;
-    let backup = staging.0.with_extension("previous");
-    let replacing = output.exists();
-    if replacing {
-        validate_output(&input.path, &output, options.overwrite)?;
-        if backup.exists() {
-            return Err("analyze/output: backup path already exists".into());
-        }
-        fs::rename(&output, &backup).map_err(|e| format!("analyze/output backup: {e}"))?;
-    }
-    if let Err(e) = fs::rename(temp, &output) {
-        if replacing {
-            fs::rename(&backup, &output).map_err(|restore| {
-                format!(
-                    "analyze/output: {e}; previous report retained at {}: {restore}",
-                    backup.display()
-                )
-            })?;
-        }
-        return Err(format!("analyze/output publish: {e}"));
-    }
-    if replacing {
-        fs::remove_dir_all(backup).map_err(|e| format!("analyze/output backup cleanup: {e}"))?;
-    }
-    Ok(AnalysisBundle {
-        directory: output,
-        summary,
-    })
-}
-// Only a complete, recognizable bundle may be replaced. Never remove an input/ancestor.
-fn validate_output(input: &Path, output: &Path, overwrite: bool) -> Result<(), String> {
-    if !output.exists() {
-        return Ok(());
-    }
-    let target = output.canonicalize().map_err(|e| e.to_string())?;
-    let input = input.canonicalize().map_err(|e| e.to_string())?;
-    if input.starts_with(&target) || target.starts_with(&input) {
-        return Err("analyze/output: output overlaps input; choose a separate directory".into());
-    }
-    if !overwrite {
-        return Err(
-            "analyze/output: directory exists; choose another path or use --overwrite".into(),
-        );
-    }
-    let allowed = [
-        "manifest.json",
-        "summary.json",
-        "summary.md",
-        "processed.csv",
-        "spectrum.csv",
-        "band-power.csv",
-        "quality-events.csv",
-    ];
-    if !target.join("manifest.json").is_file() || !target.join("summary.json").is_file() {
-        return Err("analyze/output: --overwrite requires an existing AnalysisBundle".into());
-    }
-    for entry in fs::read_dir(&target).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if !entry.file_type().map_err(|e| e.to_string())?.is_file()
-            || !allowed.contains(&entry.file_name().to_string_lossy().as_ref())
-        {
-            return Err("analyze/output: refusing to overwrite unrelated files".into());
-        }
-    }
-    Ok(())
-}
-struct Staging(PathBuf);
-impl Staging {
-    fn new(output: &Path) -> Result<Self, String> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let parent = output
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        for _ in 0..1000 {
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = parent.join(format!(
-                ".lemon-analysis-{}-{n}.partial",
-                std::process::id()
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        Err("analyze/output: cannot allocate staging directory".into())
-    }
-}
-impl Drop for Staging {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-fn make_output(
-    _input: &Path,
-    o: &AnalysisOptions,
-    meta: &Metadata,
-) -> Result<PathBuf, AnalysisError> {
-    if let Some(p) = &o.output {
-        if let Some(parent) = p.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("analyze/output {}: {e}", parent.display()))?;
-        }
-        return Ok(p.clone());
-    }
-    let parent = Path::new(&meta.config.recording_dir);
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    for n in 0..1000 {
-        let p = parent.join(format!(
-            "analysis-{}-{}",
-            meta.config
-                .session
-                .name
-                .replace(|c: char| !c.is_ascii_alphanumeric(), "_"),
-            n
-        ));
-        if !p.exists() {
-            return Ok(p);
-        }
-    }
-    Err("analyze/output: cannot create unique directory".into())
+    let directory = output.commit()?;
+    Ok(AnalysisBundle { directory, summary })
 }
 #[allow(clippy::too_many_arguments)]
 fn build_summary(
@@ -1020,6 +933,9 @@ fn build_summary(
     let mut valid = BTreeMap::new();
     let mut missing = BTreeMap::new();
     let mut dominant = BTreeMap::new();
+    let mut valid_windows = BTreeMap::new();
+    let mut excluded_windows = BTreeMap::new();
+    let mut exclusion_reasons = BTreeMap::new();
     for (i, a) in ag.iter().enumerate() {
         let id = if a.id.is_empty() {
             format!("ch{}", i + 1)
@@ -1030,6 +946,11 @@ fn build_summary(
         sample.insert(id.clone(), total);
         valid.insert(id.clone(), a.filtered.n);
         missing.insert(id.clone(), a.missing);
+        valid_windows.insert(id.clone(), a.windows);
+        excluded_windows.insert(id.clone(), a.excluded_windows);
+        for (reason, count) in &a.exclusion_reasons {
+            *exclusion_reasons.entry(reason.clone()).or_default() += count;
+        }
         let dist = ["Good", "Acceptable", "Poor", "Disconnected", "Unknown"]
             .into_iter()
             .map(|k| {
@@ -1137,16 +1058,39 @@ fn build_summary(
         channels,
         warnings: w.to_vec(),
         dominant_band_by_channel: dominant,
+        valid_spectral_window_count_by_channel: valid_windows,
+        excluded_spectral_window_count_by_channel: excluded_windows,
+        excluded_window_reasons: exclusion_reasons,
     }
 }
 fn summary_markdown(m: &Manifest, s: &Summary) -> String {
     let mut out = String::from("# LEMON Signal Analysis\n\n## Recording\n\n");
-    out.push_str(&format!("Source: `{}`\n\nDuration: {:.3} s\nChannels: {}\nSample rate: {:.6} Hz ({})\n\n## Import\n\nFormat: `{}`\nHash: `{}`\n\n## Processing performed\n\n- Applied high-pass filter: {} Hz.\n- Applied low-pass filter: {} Hz.\n- Applied notch filter: {}{}\n- Spectrum: Hann window, {} samples, hop {} samples.\n\n## Signal continuity and quality\n\nSegments: {}\n",m.source_path,s.duration_seconds,s.channel_count,s.sample_rate_hz,s.sample_rate_source,m.source_format,m.source_hash,m.processing_config.high_pass_hz,m.processing_config.low_pass_hz,if m.processing_config.notch{"enabled"}else{"disabled"},if m.processing_config.notch{format!(" at {} Hz",m.processing_config.notch_hz)}else{String::new()},m.spectral_config.window_samples,m.spectral_config.hop_samples,s.continuous_segment_count));
-    out.push_str(&format!("\nStatistics basis: {}\n\nMains measurement interval: {}–{} Hz; PSD integrated with bin width.\n\nPeak aggregation: {}.\n", m.statistics_basis, m.mains_interval_hz[0], m.mains_interval_hz[1], m.spectral_config.aggregation));
+    out.push_str(&format!("Source: `{}`\n\nDuration: {:.3} s\nChannels: {}\nSample rate: {:.6} Hz ({})\n\n## Import\n\nFormat: `{}`\nHash: `{}`\n\n## Processing performed\n\n- Applied high-pass filter: {} Hz.\n- Applied low-pass filter: {} Hz.\n- Applied notch filter: {}{}\n- Spectrum: symmetric Hann window, {} samples, hop {} samples.\n\n## Signal continuity and quality\n\nSegments: {}\n",m.source_path,s.duration_seconds,s.channel_count,s.sample_rate_hz,s.sample_rate_source,m.source_format,m.source_hash,m.processing_config.high_pass_hz,m.processing_config.low_pass_hz,if m.processing_config.notch{"enabled"}else{"disabled"},if m.processing_config.notch{format!(" at {} Hz",m.processing_config.notch_hz)}else{String::new()},m.spectral_config.window_samples,m.spectral_config.hop_samples,s.continuous_segment_count));
+    out.push_str(&format!("\nStatistics basis: {}\n\nDSP algorithm version: {}. Processing mode: `{}`. Filter warmup: {:.3} s. Window function: `{}`.\n\nMains measurement interval: {}–{} Hz; PSD integrated with bin width.\n\nPeak aggregation: {}.\n", m.statistics_basis, m.dsp_algorithm_version, m.processing_mode, m.filter_warmup_seconds, window_name(m.window_function), m.mains_interval_hz[0], m.mains_interval_hz[1], m.spectral_config.aggregation));
     for (ch, c) in &s.channels {
         out.push_str(&format!("- {}: raw samples {}, valid filtered {}, dominant peak {} Hz, power reduction after processing {}%.\n",ch,s.sample_count_by_channel.get(ch).unwrap_or(&0),s.valid_filtered_count_by_channel.get(ch).unwrap_or(&0),c.dominant_peak_frequency_hz.map(|v| format!("{v:.6}")).unwrap_or_else(|| "not available".into()),c.mains_reduction_percent.map(|v| format!("{v:.3}")).unwrap_or_else(|| "not available".into())));
     }
-    out.push_str("\n## Spectral measurements\n\nEach recorded spectrum is a PSD frame from the existing Processor; no cognitive interpretation is applied.\n\n## Configured frequency bands\n\n");
+    out.push_str("\nSpectral window eligibility:\n\n");
+    for channel in &m.channels {
+        out.push_str(&format!(
+            "- {}: valid {}, excluded {}.\n",
+            channel,
+            s.valid_spectral_window_count_by_channel
+                .get(channel)
+                .copied()
+                .unwrap_or(0),
+            s.excluded_spectral_window_count_by_channel
+                .get(channel)
+                .copied()
+                .unwrap_or(0)
+        ));
+    }
+    for (reason, count) in &s.excluded_window_reasons {
+        out.push_str(&format!(
+            "- Exclusion reason `{reason}`: {count} candidates.\n"
+        ));
+    }
+    out.push_str("\n## Spectral measurements\n\nEach recorded spectrum uses the shared processing PSD API on an eligible window; no cognitive interpretation is applied.\n\n## Configured frequency bands\n\n");
     for (channel, c) in &s.channels {
         out.push_str(&format!("\nChannel: {}\n\n", channel));
         for (band, b) in &c.band_statistics {

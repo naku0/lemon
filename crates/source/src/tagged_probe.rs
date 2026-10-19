@@ -119,7 +119,7 @@ pub fn inspect_tagged_capture(path: &Path) -> Result<Option<TaggedCandidate>> {
                 first_start.get_or_insert(total - size as u64);
                 last_end = total;
                 frames += 1;
-                let values: Vec<u8> = pending.chunks_exact(3).map(|p| p[2]).collect();
+                let values: Vec<u8> = pending.as_chunks::<3>().0.iter().map(|p| p[2]).collect();
                 if let Some(previous) = previous {
                     for i in 0..tags.len() {
                         let delta = values[i].wrapping_sub(previous[i]);

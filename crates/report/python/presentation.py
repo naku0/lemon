@@ -85,7 +85,7 @@ def _initialize_metadata():
         manifest = REPORT_DATASET["manifest"]
         summary = REPORT_DATASET["summary"]
         FULL_SAMPLE_DATA = (ROOT / "processed.csv").is_file()
-    if manifest.get("analysis_format_version") != 1:
+    if manifest.get("analysis_format_version") not in (1, 2):
         raise ValueError("Unsupported AnalysisBundle version")
     AVAILABLE_CHANNELS = list(summary.get("channels", {}))
     if not 1 <= len(AVAILABLE_CHANNELS) <= 2:

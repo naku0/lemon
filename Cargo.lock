@@ -85,11 +85,14 @@ dependencies = [
  "core",
  "ctrlc",
  "directories",
+ "experiment",
+ "plugins",
  "processing",
  "report",
  "serde_json",
  "source",
  "storage",
+ "study",
  "tui",
 ]
 
@@ -474,6 +477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "experiment"
+version = "0.2.0"
+dependencies = [
+ "core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -592,6 +605,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "lemon-plugin-sdk"
+version = "0.2.0"
+dependencies = [
+ "analysis",
+ "csv",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -671,6 +694,33 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mu-condition-analysis"
+version = "0.2.0"
+dependencies = [
+ "analysis",
+ "core",
+ "csv",
+ "lemon-plugin-sdk",
+ "processing",
+ "serde",
+ "serde_json",
+ "storage",
+]
+
+[[package]]
+name = "mu-erd"
+version = "0.2.0"
+dependencies = [
+ "csv",
+ "lemon-plugin-sdk",
+ "plugins",
+ "processing",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -778,6 +828,17 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "plugins"
+version = "0.2.0"
+dependencies = [
+ "analysis",
+ "directories",
+ "lemon-plugin-sdk",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "primal-check"
@@ -1088,6 +1149,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "study"
+version = "0.2.0"
+dependencies = [
+ "analysis",
+ "core",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1145,6 +1217,8 @@ version = "0.2.0"
 dependencies = [
  "core",
  "crossterm",
+ "experiment",
+ "plugins",
  "ratatui",
  "serde",
  "serde_json",

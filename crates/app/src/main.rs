@@ -1,13 +1,12 @@
 use analysis::{analyze, AnalysisBundle, AnalysisInput, AnalysisOptions};
 use app::{
-    cli::{self, Action, Cli, ConfigAction, Environment, LogLevel},
+    cli::{self, Action, Cli, Environment, LogLevel},
     Runtime,
 };
 use clap::Parser;
-use core_types::{Config, Result};
+use core_types::Result;
 use report::{render_notebook, ExecutionMode, ReportOptions};
 use std::{
-    fs,
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
@@ -19,31 +18,19 @@ use std::{
 };
 use tui::{settings::Settings, UiOptions};
 
+mod config_commands;
+mod experiment_controller;
+mod logging;
+mod plugin_commands;
+mod report_support;
+
+use logging::Logger;
+use report_support::TempAnalysis;
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("LEMON: {e}");
         std::process::exit(1);
-    }
-}
-fn open_report(path: &Path) {
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(path).status();
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("explorer.exe")
-        .arg(path)
-        .status();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let result = std::process::Command::new("xdg-open").arg(path).status();
-    match result {
-        Ok(status) if !status.success() => eprintln!(
-            "LEMON: не удалось открыть notebook ({status}); путь: {}",
-            path.display()
-        ),
-        Err(e) => eprintln!(
-            "LEMON: не удалось открыть notebook: {e}; путь: {}",
-            path.display()
-        ),
-        _ => {}
     }
 }
 fn run() -> Result<()> {
@@ -52,6 +39,14 @@ fn run() -> Result<()> {
         return Err(hint.into());
     }
     let mut cli = Cli::parse();
+    cli.normalize_run();
+    let experiment_request = experiment_controller::Request::from_cli(&mut cli)?;
+    if matches!(
+        cli.command,
+        Some(Action::Plugins { .. }) | Some(Action::Plugin { .. })
+    ) {
+        return plugin_commands::run(&cli);
+    }
     if let Some(Action::Report {
         command: Some(command),
         ..
@@ -144,7 +139,7 @@ fn run() -> Result<()> {
             return Ok(());
         }
         if let Some(Action::Config { command }) = &cli.command {
-            return config_command(command, &cli);
+            return config_commands::run(command, &cli);
         }
     }
     let settings_path = cli::settings_path(&cli)?;
@@ -159,6 +154,9 @@ fn run() -> Result<()> {
             | Some(Action::Analyze { .. })
             | Some(Action::Report { .. })
             | Some(Action::Replay { .. })
+            | Some(Action::Run {
+                command: cli::RunAction::Study { .. }
+            })
     ) {
         let config_path = cli
             .config
@@ -171,6 +169,36 @@ fn run() -> Result<()> {
             .transpose()?
             .unwrap_or_default();
         match &cli.command {
+            Some(Action::Run {
+                command:
+                    cli::RunAction::Study {
+                        manifest,
+                        output,
+                        overwrite,
+                    },
+            }) => {
+                if cli.record || cli.headless || cli.duration.is_some() || cli.channels.is_some() {
+                    return Err(
+                        "study: --record/--headless/--duration/--channels are not applicable"
+                            .into(),
+                    );
+                }
+                let result = study::run(study::StudyRequest {
+                    manifest: manifest.clone(),
+                    output: output.clone(),
+                    config: base.clone(),
+                    overwrite: *overwrite,
+                })?;
+                println!("Study completed: {}", result.directory.display());
+                println!(
+                    "Mu condition config: {}",
+                    result
+                        .directory
+                        .join("mu-condition-analysis.json")
+                        .display()
+                );
+                return Ok(());
+            }
             Some(Action::Analyze {
                 input,
                 output,
@@ -238,8 +266,8 @@ fn run() -> Result<()> {
                 let bundle = if let Some(path) = analysis {
                     AnalysisBundle::open(path)?
                 } else if let Some(path) = input {
-                    let temp = ReportTemp::new()?;
-                    let temp_path = temp.0.join("analysis");
+                    let temp = TempAnalysis::new()?;
+                    let temp_path = temp.path().join("analysis");
                     report_temp = Some(temp);
                     analyze(
                         AnalysisInput { path: path.clone() },
@@ -321,7 +349,7 @@ fn run() -> Result<()> {
                     eprintln!("LEMON: {warning}");
                 }
                 if *open {
-                    open_report(&artifacts.notebook);
+                    report_support::open(&artifacts.notebook);
                 }
                 return Ok(());
             }
@@ -418,6 +446,23 @@ fn run() -> Result<()> {
     }
     let source = source::open(&config.source)?;
     let mut runtime = Runtime::start(config.clone(), source, cli.record)?;
+    let (experiment_ui, experiment_worker) = if let Some(request) = experiment_request {
+        let (ui, worker) = experiment_controller::start(
+            request,
+            runtime.status.clone(),
+            runtime.commands.clone(),
+            runtime.stop.clone(),
+        )?;
+        (Some(ui), Some(worker))
+    } else {
+        (None, None)
+    };
+    let experiment_control = experiment_ui
+        .as_ref()
+        .map(|experiment| experiment.commands.clone());
+    let experiment_snapshot = experiment_ui
+        .as_ref()
+        .map(|experiment| experiment.snapshot.clone());
     let interrupt = Arc::new(AtomicBool::new(false));
     let signal = if cli.headless {
         runtime.stop.clone()
@@ -479,6 +524,17 @@ fn run() -> Result<()> {
     });
     let result = if cli.headless {
         loop {
+            let experiment_finished = experiment_ui.as_ref().is_some_and(|ui| {
+                matches!(
+                    ui.snapshot
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .status,
+                    experiment::Status::Completed
+                        | experiment::Status::Cancelled
+                        | experiment::Status::Failed
+                )
+            });
             if runtime
                 .status
                 .lock()
@@ -486,6 +542,7 @@ fn run() -> Result<()> {
                 .finished
                 || runtime.stop.load(Ordering::Relaxed)
                 || duration_limit.is_some_and(|d| started.elapsed().as_secs_f64() >= d)
+                || experiment_finished
             {
                 break;
             }
@@ -519,6 +576,9 @@ fn run() -> Result<()> {
                     data_directory_locked: cli.data_dir.is_some() || environment.data_dir.is_some(),
                     experiment_directory: resolved.experiment_directory,
                     experiment_session_name: resolved.experiment_session_name,
+                    plugin_registry_path: plugins::default_registry_path()
+                        .map_err(|e| e.to_string())?,
+                    experiment: experiment_ui,
                 },
             ) {
                 Ok(updated) => {
@@ -530,11 +590,39 @@ fn run() -> Result<()> {
             None => Err("TUI subscription missing".into()),
         }
     };
+    if experiment_snapshot.as_ref().is_some_and(|snapshot| {
+        !matches!(
+            snapshot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .status,
+            experiment::Status::Completed
+                | experiment::Status::Cancelled
+                | experiment::Status::Failed
+        )
+    }) {
+        if let Some(control) = &experiment_control {
+            let _ = control.send(experiment::Control::Cancel(
+                "LEMON stopped before protocol completion".into(),
+            ));
+        }
+    }
+    let experiment_result = experiment_worker
+        .map(|worker| {
+            worker
+                .join()
+                .map_err(|_| "Experiment worker panicked".to_string())
+        })
+        .transpose()?
+        .transpose()?;
     let final_status = runtime.shutdown();
     log_stop.store(true, Ordering::Relaxed);
     let mut logger = logging.join().map_err(|_| "Logger thread failed")?;
     let final_status = final_status?;
     result?;
+    if let Some(path) = experiment_result {
+        println!("Experiment sidecar: {}", path.display());
+    }
     let totals = format!(
         "blocks={} samples={} lost={} errors={} outliers={} consumer_blocks={} consumer_dropped={}",
         final_status.processed_blocks,
@@ -565,122 +653,18 @@ fn run() -> Result<()> {
     }
     Ok(())
 }
+
 fn print_import(path: &Path) -> Result<()> {
-    if let Some(p) = storage::read_metadata(path)?.provenance {
-        for file in p.files_used {
+    if let Some(provenance) = storage::read_metadata(path)?.provenance {
+        for file in provenance.files_used {
             eprintln!("Import file: {file}");
         }
-        for file in p.duplicate_files_ignored {
+        for file in provenance.duplicate_files_ignored {
             eprintln!("Exact duplicate ignored: {file}");
         }
-        for warning in p.import_warnings {
+        for warning in provenance.import_warnings {
             eprintln!("Import warning: {warning}");
         }
     }
     Ok(())
-}
-fn config_command(command: &ConfigAction, cli: &Cli) -> Result<()> {
-    match command {
-        ConfigAction::Init { path, user } => {
-            let path = match path {
-                Some(path) => path.clone(),
-                None if *user => cli::settings_path(cli)?,
-                None => cli::user_directory()?.join("config.json"),
-            };
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-            }
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|e| {
-                    format!(
-                        "{}: {e}; выберите новый путь, существующие файлы не перезаписываются",
-                        path.display()
-                    )
-                })?;
-            if *user {
-                serde_json::to_writer_pretty(&file, &Settings::default())
-            } else {
-                serde_json::to_writer_pretty(&file, &Config::default())
-            }
-            .map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-            println!("Created {}", path.display());
-        }
-        ConfigAction::Check { path, user } => {
-            if *user {
-                Settings::load(path)?
-                    .ok_or_else(|| format!("Settings {} not found", path.display()))?;
-            } else {
-                cli::read_config(path)?.validate()?;
-            }
-            println!("OK: {}", path.display());
-        }
-    }
-    Ok(())
-}
-struct Logger {
-    level: LogLevel,
-    file: Option<fs::File>,
-    headless: bool,
-}
-impl Logger {
-    fn new(level: LogLevel, headless: bool, settings_path: &Path) -> Result<Self> {
-        let file = if !headless && level != LogLevel::Off {
-            let parent = settings_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            fs::create_dir_all(parent).map_err(|e| format!("Log directory: {e}"))?;
-            Some(
-                fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(parent.join("lemon.log"))
-                    .map_err(|e| format!("Log file: {e}"))?,
-            )
-        } else {
-            None
-        };
-        Ok(Self {
-            level,
-            file,
-            headless,
-        })
-    }
-    fn write(&mut self, level: LogLevel, text: &str) {
-        if self.level == LogLevel::Off || level > self.level {
-            return;
-        }
-        if self.headless {
-            eprintln!("[{level:?}] {text}");
-        } else if let Some(file) = &mut self.file {
-            let _ = writeln!(file, "[{level:?}] {text}");
-        }
-    }
-}
-
-struct ReportTemp(PathBuf);
-impl ReportTemp {
-    fn new() -> Result<Self> {
-        for n in 0..10000 {
-            let path =
-                std::env::temp_dir().join(format!("lemon-report-{}-{n}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        Err("report: cannot allocate temporary directory".into())
-    }
-}
-impl Drop for ReportTemp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }

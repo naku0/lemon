@@ -14,7 +14,7 @@ lemon import \
 
 ```bash
 ls recordings/lab2-background
-lemon replay recordings/lab2-background
+lemon run replay recordings/lab2-background
 ```
 
 В native-сеансе каналы называются `A0` и `A2`.
@@ -24,20 +24,20 @@ lemon replay recordings/lab2-background
 Replay напрямую:
 
 ```bash
-lemon replay "$HOME/Downloads/Лаб2/фон/RECORDING.dmov"
+lemon run replay "$HOME/Downloads/Лаб2/фон/RECORDING.dmov"
 ```
 
 AnalysisBundle напрямую:
 
 ```bash
-lemon analyze "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
+lemon run analyze "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
   --output reports/lab2-background-analysis
 ```
 
 Notebook напрямую:
 
 ```bash
-lemon report "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
+lemon run report create "$HOME/Downloads/Лаб2/фон/RECORDING.dmov" \
   --output reports/lab2-background-report
 ```
 

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "example-summary",
+  "display_name": "Example summary plugin",
+  "version": "0.1.0",
+  "api_version": 1,
+  "description": "Minimal example LEMON analysis plugin.",
+  "entrypoint": {
+    "program": "target/release/example-summary",
+    "args": []
+  }
+}

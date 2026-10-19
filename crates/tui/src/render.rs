@@ -201,7 +201,16 @@ pub(super) fn draw(
     ]);
     f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), parts[0]);
     let titles = if compact {
-        vec!["1 Src", "2 Wave", "3 FFT", "4 Bands", "5 Rec", "6 Settings"]
+        vec![
+            "1 Src",
+            "2 Wave",
+            "3 FFT",
+            "4 Bands",
+            "5 Rec",
+            "6 Set",
+            "7 Plugins",
+            "8 Exp",
+        ]
     } else {
         vec![
             "1 Sources",
@@ -210,6 +219,8 @@ pub(super) fn draw(
             "4 Bands",
             "5 Recording",
             "6 Settings",
+            "7 Plugins",
+            "8 Experiment",
         ]
     };
     f.render_widget(
@@ -224,10 +235,16 @@ pub(super) fn draw(
         2 => spectrum(f, parts[2], v, config, &p),
         3 => bands(f, parts[2], v, status, config, &p, compact),
         4 => recording(f, parts[2], v, status),
-        _ => settings(f, parts[2], v, config, &p),
+        5 => settings(f, parts[2], v, config, &p),
+        6 => plugins(f, parts[2], v, &p),
+        _ => experiment_view(f, parts[2], v),
     }
     let commands = if v.page == 5 {
         "Tab Screen  Up/Down Select  Enter Edit  Left/Right Change  Space Toggle  S Save  R Reset group  ? Help  Q Quit"
+    } else if v.page == 6 {
+        "Tab Screen  Up/Down Select  Enter Details  A Add  Space Enable/Disable  X Remove  R Refresh  ? Help  Q Quit"
+    } else if v.page == 7 {
+        "Tab Screen  Enter Start  Space Pause/Resume timer  Esc Cancel  Q Quit"
     } else {
         "Tab Screen  R Record  M Marker  Space Pause  ? Help  Q Quit"
     };
@@ -237,7 +254,9 @@ pub(super) fn draw(
         2 => "C Channel  Settings: linear/log PSD",
         3 => "P Absolute/Relative/Baseline  C Channel",
         4 => "Up/Down Select field  Enter Edit (before recording)",
-        _ => "[/] or PgUp/PgDn: Category | Ctrl+R Reset all | Acquisition/DSP locked",
+        5 => "[/] or PgUp/PgDn: Category | Ctrl+R Reset all | Acquisition/DSP locked",
+        6 => "Plugins are inspected only; this screen never builds or runs plugin code",
+        _ => "Protocol timing uses the recording timeline; EEG recording continues while paused",
     };
     let message = status.fatal_error.as_ref().unwrap_or(&v.message);
     f.render_widget(
@@ -431,11 +450,8 @@ fn waveform(f: &mut Frame, area: Rect, v: &View, status: &RuntimeStatus, c: &Con
     }
 }
 fn spectrum(f: &mut Frame, area: Rect, v: &View, c: &Config, p: &Palette) {
-    let Some(s) = &v.spectrum else {
-        para(f,area,"Spectrum",format!("Accumulating a contiguous FFT window: {} samples ({:.2} s).\nAfter gaps, old spectra are cleared.\nRaw and Filtered PSD will appear here.",c.processing.window_samples,c.processing.window_samples as f64/c.source.sample_rate_hz),v);
-        return;
-    };
-    let indices: Vec<_> = (0..s.channels.len()).filter(|i| v.selected(*i)).collect();
+    // Panel positions follow acquisition channels, never the number of ready FFTs.
+    let indices: Vec<_> = (0..c.source.channels).filter(|i| v.selected(*i)).collect();
     if indices.is_empty() {
         para(
             f,
@@ -459,7 +475,38 @@ fn spectrum(f: &mut Frame, area: Rect, v: &View, c: &Config, p: &Palette) {
         }
     };
     for (row, &i) in indices.iter().enumerate() {
-        let ch = &s.channels[i];
+        let id = v
+            .latest
+            .as_ref()
+            .and_then(|block| block.raw_channels.get(i))
+            .map(|channel| channel.id.clone())
+            .unwrap_or_else(|| format!("ch{}", i + 1));
+        let ready = v.spectrum.as_ref().and_then(|spectrum| {
+            spectrum
+                .channels
+                .iter()
+                .find(|channel| channel.channel == id)
+                .map(|channel| (spectrum, channel))
+        });
+        let Some((s, ch)) = ready else {
+            let warming = v
+                .latest
+                .as_ref()
+                .and_then(|block| block.sample_metadata.get(i))
+                .and_then(|samples| samples.last())
+                .is_some_and(|sample| sample.filter_warmup);
+            let state = if v.source_finished_seen {
+                "Source stopped"
+            } else if warming {
+                "Filter warmup"
+            } else {
+                "Waiting for valid window"
+            };
+            para(f, areas[row], &format!("{id} | {state}"), format!(
+                "No current PSD. A contiguous window of {} samples ({:.2} s) is required after warmup.\nInvalidated spectra are not displayed.",
+                c.processing.window_samples, c.processing.window_samples as f64 / c.source.sample_rate_hz), v);
+            continue;
+        };
         let raw: Vec<_> = s
             .frequencies
             .iter()
@@ -921,6 +968,81 @@ fn settings(f: &mut Frame, area: Rect, v: &View, c: &Config, p: &Palette) {
         parts[1],
     );
 }
+fn plugins(f: &mut Frame, area: Rect, v: &View, p: &Palette) {
+    let mut lines = Vec::new();
+    if v.plugins.is_empty() {
+        lines.push(Line::from(
+            "No plugins registered. Press A to add a local plugin directory.",
+        ));
+    }
+    for (index, plugin) in v.plugins.iter().enumerate() {
+        let color = match plugin.state {
+            plugins::PluginState::Ready => p.good,
+            plugins::PluginState::Disabled => p.muted,
+            plugins::PluginState::Unavailable | plugins::PluginState::Incompatible => p.warning,
+        };
+        let name = plugin
+            .manifest
+            .as_ref()
+            .map_or(plugin.id.as_str(), |m| m.display_name.as_str());
+        let version = plugin.manifest.as_ref().map_or("?", |m| m.version.as_str());
+        lines.push(Line::from(vec![
+            Span::styled(
+                if index == v.plugin_selection {
+                    "> "
+                } else {
+                    "  "
+                },
+                Style::default().fg(p.accent).bold(),
+            ),
+            Span::styled(
+                format!("{name} ({}) v{version} [{}]", plugin.id, plugin.state),
+                Style::default().fg(color).bold(),
+            ),
+        ]));
+        lines.push(
+            Line::from(format!(
+                "    {} | checked {}",
+                plugin.path.display(),
+                plugins::checked_at_text(plugin.checked_at)
+            ))
+            .style(Style::default().fg(p.muted)),
+        );
+        if let Some(reason) = &plugin.reason {
+            lines.push(Line::from(format!("    {reason}")).style(Style::default().fg(p.warning)));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel("Plugins — local registry", v)),
+        area,
+    );
+}
+fn experiment_view(f: &mut Frame, area: Rect, v: &View) {
+    let text = v.experiment.as_ref().map_or_else(
+        || "No experiment protocol is active. Start with `lemon experiment run`.".into(),
+        |ui| {
+            let snapshot = ui
+                .snapshot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            format!(
+                "Protocol: {}\nState: {:?}\nTrial: {} / {}\nCondition: {}\nInstruction: {}\nRemaining: {:.1} s\n\nRecording continues during protocol pause.",
+                snapshot.display_name,
+                snapshot.status,
+                snapshot
+                    .trial_number
+                    .map_or_else(|| "—".into(), |value| value.to_string()),
+                snapshot.total_trials,
+                snapshot.condition.as_deref().unwrap_or("—"),
+                snapshot.label.as_deref().unwrap_or("—"),
+                snapshot.phase_remaining_ns as f64 / 1e9,
+            )
+        },
+    );
+    para(f, area, "Experiment", text, v);
+}
 fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Palette) {
     let Some(overlay) = &v.overlay else {
         return;
@@ -930,7 +1052,7 @@ fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Pale
     let height = area.height.saturating_sub(2).min(match overlay {
         Overlay::Help => 25,
         Overlay::Summary(_) => 12,
-        Overlay::Details(_) => 20,
+        Overlay::Details(_) | Overlay::PluginDetails => 20,
         _ => 9,
     });
     let rect = Rect::new(
@@ -941,11 +1063,13 @@ fn overlay(f: &mut Frame, v: &View, status: &RuntimeStatus, c: &Config, p: &Pale
     );
     let (title,text)=match overlay {
         Overlay::Details(field) => ("Setting details (read only)", format!("{}\n\n{}\n\n{}\n\nEnter / Esc: close", field.name(), field.value(&v.settings, c), field.hint())),
-        Overlay::Help=>("LEMON Help",format!("Lightweight EEG Monitoring Of Neuroactivity\n\nTab / 1-6: screen | R: record | M: marker | Space: pause display | Q: quit\nSettings: Up/Down select; Enter edit; Left/Right change; S save; R reset group; Ctrl+R reset all.\nCurrent screen: {}\nWaveform: G Line/Points/Envelope; V raw/filtered/both; C channel; A scale; +/- seconds.\nBands: P absolute/relative/baseline; C channel. Recording: Up/Down, Enter edit.\nSources: D disconnect.\n\nRaw: original samples. Filtered: causal high-pass, low-pass and optional notch.\nTheta, Alpha/Mu and Beta are frequency-component power estimates.\nAlpha and Mu overlap (usually 8-13 Hz); electrode placement and experimental context distinguish them. 8-13 Hz alone is NOT MuERD.\n\nGood / Acceptable / Poor / Disconnected / Unknown: heuristic quality; not a validated clinical metric.\nPause affects display only. Raw recording continues. Gaps and absent baseline are never zeros.\nThis application is NOT a medical device. Serial clocks are reconstructed from the nominal rate; hardware timing is not verified.\n\nEsc closes Help; it does not exit LEMON.",["Sources","Waveform","Spectrum","Bands","Recording","Settings"][v.page])),
+        Overlay::PluginDetails => ("Plugin details",v.plugins.get(v.plugin_selection).map(|plugin|format!("Name: {}\nID: {}\nVersion: {}\nAPI: {}\nState: {}\nPath: {}\nLast check: {}\nReason: {}\n\nNo plugin code was loaded or run.",plugin.manifest.as_ref().map_or(plugin.id.as_str(),|m|m.display_name.as_str()),plugin.id,plugin.manifest.as_ref().map_or("?",|m|m.version.as_str()),plugin.manifest.as_ref().map_or("?".into(),|m|m.api_version.to_string()),plugin.state,plugin.path.display(),plugins::checked_at_text(plugin.checked_at),plugin.reason.as_deref().unwrap_or("—"))).unwrap_or_else(||"No plugin selected".into())),
+        Overlay::Help=>("LEMON Help",format!("Lightweight EEG Monitoring Of Neuroactivity\n\nTab / 1-8: screen | R: record | M: marker | Space: pause display | Q: quit\nSettings: Up/Down select; Enter edit; Left/Right change; S save; R reset group; Ctrl+R reset all.\nPlugins: A add; Space enable/disable; X remove from registry; R refresh.\nExperiment: Enter start; Space pause/resume timer; Esc cancel with confirmation.\nCurrent screen: {}\nWaveform: G Line/Points/Envelope; V raw/filtered/both; C channel; A scale; +/- seconds.\nBands: P absolute/relative/baseline; C channel. Recording: Up/Down, Enter edit.\nSources: D disconnect.\n\nRaw: original samples. Filtered: causal high-pass, low-pass and optional notch.\nTheta, Alpha/Mu and Beta are frequency-component power estimates.\nAlpha and Mu overlap (usually 8-13 Hz); electrode placement and experimental context distinguish them. 8-13 Hz alone is NOT MuERD.\n\nGood / Acceptable / Poor / Disconnected / Unknown: heuristic quality; not a validated clinical metric.\nPause affects display only. Raw recording continues. Gaps and absent baseline are never zeros.\nThis application is NOT a medical device. Serial clocks are reconstructed from the nominal rate; hardware timing is not verified.\n\nEsc closes Help; it does not exit LEMON.",["Sources","Waveform","Spectrum","Bands","Recording","Settings","Plugins","Experiment"][v.page])),
         Overlay::Quit=>("Confirm exit",if status.recording_active || v.record_requested{"Запись активна. Остановить запись и выйти?\n[Y] Да  [N] Вернуться\n\nQueued samples will be flushed before exit.".into()}else{"Exit LEMON?\n[Y] Yes  [N] Return".into()}),
+        Overlay::ExperimentCancel=>("Cancel experiment","Cancel the protocol? EEG recorded so far and all markers will be kept.\n[Y] Cancel  [N] Continue".into()),
         Overlay::Reset=>("Reset all settings","Reset every preference to defaults?\n[Y] Reset  [N] Return\nThis does not change experiment/DSP configuration. Save with S to persist.".into()),
         Overlay::Summary(s)=>("Recording complete",format!("{}\n\nEnter / Esc: close",summary(s))),
-        Overlay::Edit(target,text)=>("Edit",format!("{}\n\n{}\n\nEnter: apply | Esc: cancel\n{}",match target{EditTarget::Setting(field)=>field.name(),EditTarget::Session(_)=>"Session field (next recording)",EditTarget::Marker=>"Marker"},text,v.message)),
+        Overlay::Edit(target,text)=>("Edit",format!("{}\n\n{}\n\nEnter: apply | Esc: cancel\n{}",match target{EditTarget::Setting(field)=>field.name(),EditTarget::Session(_)=>"Session field (next recording)",EditTarget::Marker=>"Marker",EditTarget::PluginPath=>"Absolute or relative plugin directory"},text,v.message)),
     };
     let _ = c;
     f.render_widget(Clear, rect);
@@ -1017,6 +1141,8 @@ mod tests {
                 data_directory_locked: false,
                 experiment_directory: c.recording_dir.clone(),
                 experiment_session_name: c.session.name.clone(),
+                plugin_registry_path: std::path::PathBuf::from("unused-plugins.json"),
+                experiment: None,
             },
         );
         v.page = 5;
@@ -1064,11 +1190,13 @@ mod tests {
                 data_directory_locked: false,
                 experiment_directory: c.recording_dir.clone(),
                 experiment_session_name: c.session.name.clone(),
+                plugin_registry_path: std::path::PathBuf::from("unused-plugins.json"),
+                experiment: None,
             },
         );
         for (w, h) in [(160, 42), (80, 24), (40, 10)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
-            for page in 0..6 {
+            for page in 0..8 {
                 v.page = page;
                 terminal
                     .draw(|f| draw(f, &c, &[], &v, &RuntimeStatus::default(), 0))
@@ -1099,6 +1227,8 @@ mod tests {
                 data_directory_locked: false,
                 experiment_directory: c.recording_dir.clone(),
                 experiment_session_name: c.session.name.clone(),
+                plugin_registry_path: std::path::PathBuf::from("unused-plugins.json"),
+                experiment: None,
             },
         );
         for i in 0..2 {

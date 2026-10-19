@@ -12,22 +12,35 @@ LEMON — локальное приложение для записи, прос�
 - записывает исходные отсчёты до DSP и воспроизводит сохранённые сеансы;
 - принимает Serial CSV и бинарный tagged-u8 от Arduino;
 - импортирует CSV, DAT, DMOV и каталоги внешних записей;
+- пакетно подготавливает отдельные фоновые и condition-записи через offline study;
 - создаёт AnalysisBundle с JSON/CSV и нейтральным техническим summary;
 - генерирует локальные Jupyter-отчёты, portable ZIP и Colab notebook;
 - запускает локальные аналитические плагины в отдельных процессах.
+- выполняет воспроизводимые trial-протоколы и записывает структурированные маркеры.
 
 ## Что вы хотите сделать?
 
 | Задача | Первая команда | Инструкция |
 |---|---|---|
-| Посмотреть интерфейс без оборудования | `lemon demo` | [Быстрый старт](docs/getting-started.md) |
+| Посмотреть интерфейс без оборудования | `lemon run demo` | [Быстрый старт](docs/getting-started.md) |
 | Записать сигнал с Arduino | `lemon ports` | [Serial и Arduino](docs/serial.md) |
-| Открыть старую запись | `lemon replay PATH` | [Быстрый старт](docs/getting-started.md#4-откройте-готовую-запись) |
+| Открыть старую запись | `lemon run replay PATH` | [Быстрый старт](docs/getting-started.md#4-откройте-готовую-запись) |
 | Импортировать DMOV Лаб‑2 | `lemon import FILE.dmov` | [DMOV](docs/dmov.md) |
-| Получить CSV и численное резюме | `lemon analyze INPUT` | [AnalysisBundle](docs/analysis.md) |
-| Создать Jupyter Notebook | `lemon report INPUT` | [Отчёты](docs/reports.md) |
+| Получить CSV и численное резюме | `lemon run analyze INPUT` | [AnalysisBundle](docs/analysis.md) |
+| Подготовить фон и упражнения Лаб‑2 | `lemon run study --help` | [Offline study](docs/studies.md) |
+| Создать Jupyter Notebook | `lemon run report create INPUT` | [Отчёты](docs/reports.md) |
 | Запустить аналитический плагин | `lemon plugins list` | [Плагины](docs/plugins.md) |
+| Записать эксперимент с фазами | `lemon run experiment --help` | [Эксперименты](docs/experiments.md) |
 | Исправить ошибку запуска | — | [Частые проблемы](docs/troubleshooting.md) |
+
+Основные группы команд:
+
+| Группа | Для чего |
+|---|---|
+| `lemon run …` | Запуск live, demo, replay, анализа, study, эксперимента, плагина или отчёта |
+| `lemon plugins …` | Подключение и управление локальными плагинами |
+| `lemon config …` | Создание и проверка конфигурации |
+| `lemon import`, `export`, `ports`, `probe` | Импорт, экспорт и диагностика источников |
 
 ## Установка
 
@@ -36,7 +49,7 @@ LEMON — локальное приложение для записи, прос�
 ```bash
 cargo build --locked
 ./target/debug/lemon --version
-./target/debug/lemon demo
+./target/debug/lemon run demo
 ```
 
 Чтобы команда `lemon` работала из любого каталога:
@@ -52,19 +65,19 @@ lemon --version
 
 ```bash
 # 1. Открыть демонстрационный сигнал
-lemon demo
+lemon run demo
 
 # 2. Создать десятисекундную тестовую запись
-lemon demo --headless --duration 10 --record
+lemon run demo --headless --duration 10 --record
 
 # 3. Посмотреть созданные записи
 ls recordings
 
 # 4. Проанализировать нужный каталог, напечатанный предыдущей командой
-lemon analyze recordings/SESSION --output reports/demo-analysis
+lemon run analyze recordings/SESSION --output reports/demo-analysis
 
 # 5. Создать notebook без настройки Python
-lemon report --analysis reports/demo-analysis --no-execute \
+lemon run report create --analysis reports/demo-analysis --no-execute \
   --output reports/demo-report
 ```
 
@@ -77,20 +90,20 @@ lemon report --analysis reports/demo-analysis --no-execute \
         ↓
 native-запись LEMON / импорт
         ↓
-lemon analyze → AnalysisBundle с CSV и summary
+lemon run analyze → AnalysisBundle с CSV и summary
         ↓
-lemon report  → Jupyter Notebook
-        └─────→ аналитические плагины
+lemon run report create → Jupyter Notebook
+        └───────────────→ lemon run plugin
 ```
 
 Raw сохраняется отдельно от Filtered. Пропуски не заменяются нулями. Отчёты и плагины используют готовый AnalysisBundle и не меняют исходную запись.
 
 ## Где искать результат
 
-- live/demo с `--record`: каталог `recordings/` в текущей директории;
-- `analyze --output DIR`: указанный `DIR`;
-- `report --output DIR`: `DIR/report.ipynb`;
-- `plugin run --output DIR`: `DIR/plugin-result.json` и заявленные плагином файлы.
+- `run live`/`run demo` с `--record`: каталог `recordings/` в текущей директории;
+- `run analyze --output DIR`: указанный `DIR`;
+- `run report create --output DIR`: `DIR/report.ipynb`;
+- `run plugin --output DIR`: `DIR/plugin-result.json` и заявленные плагином файлы.
 
 LEMON также печатает итоговый путь после успешной команды. Существующие результаты не перезаписываются без явного `--overwrite`.
 
@@ -102,8 +115,10 @@ LEMON также печатает итоговый путь после успе�
 - [Serial и Arduino](docs/serial.md) — поиск порта, `probe`, один и два канала;
 - [DMOV](docs/dmov.md) — импорт записей Лаб‑2;
 - [Технический анализ](docs/analysis.md) — содержимое AnalysisBundle;
+- [Offline study](docs/studies.md) — единая подготовка фона и отдельных условий;
 - [Jupyter-отчёты](docs/reports.md) — Python environment, local, ZIP и Colab;
-- [Плагины](docs/plugins.md) — подключение и запуск, включая Mu condition analysis;
+- [Плагины](docs/plugins.md) — подключение и запуск, включая Mu condition analysis и [event-locked Mu/Beta](plugins/mu-erd/README.md);
+- [Эксперименты](docs/experiments.md) — protocol JSON, trials, markers и sidecar;
 - [Settings и темы](docs/settings.md) — управление интерфейсом;
 - [Частые проблемы](docs/troubleshooting.md) — PATH, TMPDIR, Serial, Python и output;
 - [Архитектура](docs/architecture.md) и [разработка](docs/development.md) — для разработчиков.

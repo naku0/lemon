@@ -1,0 +1,20 @@
+[package]
+name = "mu-condition-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lemon-plugin-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+processing.workspace = true
+
+[dev-dependencies]
+analysis.workspace = true
+core_types.workspace = true
+storage.workspace = true

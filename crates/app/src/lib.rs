@@ -274,6 +274,19 @@ impl Worker {
                     self.event("Notice", "Метка не записана: запись выключена")?;
                 }
             }
+            Command::StructuredEvent(event) => {
+                if self.writer.is_some() {
+                    if let Some(writer) = &mut self.writer {
+                        writer.write_event(&event)?;
+                    }
+                    self.update(|status| status.events.push(event));
+                } else {
+                    self.event(
+                        "ExperimentError",
+                        "Experiment marker not recorded: recording is off",
+                    )?;
+                }
+            }
             Command::Disconnect => {
                 self.disconnect.store(true, Ordering::Relaxed);
                 self.update(|s| s.connection = "Disconnected".into());
@@ -341,6 +354,7 @@ impl Worker {
                             for flag in &processed.flags {
                                 if *flag != SignalFlag::InsufficientData
                                     && *flag != SignalFlag::LowQuality
+                                    && *flag != SignalFlag::FilterWarmup
                                 {
                                     if let Err(e) = self.event(
                                         &format!("{flag:?}"),

@@ -1,5 +1,9 @@
 # Документация LEMON
 
+Рабочие режимы запускаются через `lemon run …`. Реестр плагинов управляется
+через `lemon plugins …`, настройки — через `lemon config …`; `import`, `export`,
+`ports` и `probe` остаются отдельными утилитами.
+
 Выберите страницу по задаче:
 
 ## Начало работы
@@ -15,9 +19,11 @@
 
 ## Результаты
 
-- [AnalysisBundle](analysis.md) — JSON/CSV от `lemon analyze`;
+- [AnalysisBundle](analysis.md) — JSON/CSV от `lemon run analyze`;
+- [Offline study](studies.md) — пакетная подготовка отдельных фоновых и condition-записей;
 - [Jupyter-отчёты](reports.md) — local, portable ZIP и Colab;
 - [Плагины](plugins.md) — подключение, запуск и Mu condition analysis.
+- [Эксперименты](experiments.md) — trial plan, фазовые markers и запись sidecar.
 
 ## Для разработчиков
 

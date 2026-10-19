@@ -1,0 +1,16 @@
+{
+  "processing": {
+    "bands": [
+      {
+        "name": "Mu",
+        "low_hz": 8.0,
+        "high_hz": 13.0
+      },
+      {
+        "name": "Beta",
+        "low_hz": 13.0,
+        "high_hz": 30.0
+      }
+    ]
+  }
+}

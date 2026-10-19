@@ -3,7 +3,7 @@
 Откройте LEMON и перейдите на вкладку Settings. Для безопасного знакомства используйте demo:
 
 ```bash
-lemon demo
+lemon run demo
 ```
 
 ## Навигация

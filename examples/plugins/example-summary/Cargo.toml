@@ -1,0 +1,12 @@
+[package]
+name = "example-summary"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+lemon-plugin-sdk = { path = "../../../crates/lemon-plugin-sdk" }
+serde_json = "1"
+

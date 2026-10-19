@@ -134,10 +134,16 @@ def tui_run(config, exit_key, record):
         wait_for(master, output, "Reset all settings")
         os.write(master, b"n2")
         hold(master, output, 0.2)
+        os.write(master, b"7")
+        wait_for(master, output, "Plugins — local registry")
+        os.write(master, b"8")
+        wait_for(master, output, "No experiment protocol is active")
+        os.write(master, b"2")
         if record:
             os.write(master, b"r")
             wait_for(master, output, "REC")
-            hold(master, output, 2.3)
+            # Default DSP needs 2 s filter warmup plus a 2 s FFT window.
+            hold(master, output, 4.3)
             os.write(master, b"mtest marker\r")
             wait_for(master, output, "Marker saved")
             os.write(master, b" ")  # visualization pause must not pause recording
@@ -181,7 +187,7 @@ def tui_run(config, exit_key, record):
             (ROOT / "target/tui-smoke.ansi").write_bytes(output)
     finally:
         if proc.poll() is None:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
         os.close(master)
         os.close(slave)
@@ -191,8 +197,11 @@ def tui_run(config, exit_key, record):
 def serial_run(config):
     master, slave = pty.openpty()
     port = os.ttyname(slave)
+    # A virtual PTY does not reset like an Arduino when it is opened. Disable
+    # the device-oriented startup grace period so the bytes below exercise the
+    # CSV decoder and recovery path instead of being intentionally discarded.
     proc = subprocess.Popen([str(BIN), "live", "--config", str(config), "--settings", str(config.parent / "settings.json"), "--headless",
-                             "--record", "--port", port, "--channels", "1"],
+                             "--record", "--port", port, "--channels", "1", "--startup-delay-ms", "0"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
     try:
         time.sleep(0.2)
@@ -220,6 +229,9 @@ def main():
         tmp = Path(tmp)
         config = json.loads((ROOT / "examples/synthetic.json").read_text())
         config["recording_dir"] = str(tmp / "recordings")
+        # This smoke checks TUI spectrum rendering; low-quality rejection has
+        # dedicated Rust tests and would intentionally suppress this noisy demo PSD.
+        config["processing"]["reject_low_quality_windows"] = False
         path = tmp / "config.json"
         path.write_text(json.dumps(config))
         output = tui_run(path, b"q", True)
@@ -236,7 +248,7 @@ def main():
                                 capture_output=True, timeout=8, env=ENV)
         assert replay.returncode == 0, replay.stderr
         assert f"samples={len(rows) * 2}".encode() in replay.stdout, replay.stdout
-        print(f"PASS LEMON: Settings/theme/save, Help/Esc, reset cancel, six screens, band history, marker, pause, exit confirmation; {len(rows)} raw rows; replay exact sample count")
+        print(f"PASS LEMON: Settings/theme/save, Help/Esc, reset cancel, eight screens including Plugins/Experiment, band history, marker, pause, exit confirmation; {len(rows)} raw rows; replay exact sample count")
         (tmp / "settings.json").unlink()  # each run starts with the documented default theme
         tui_run(path, b"\x03", False)
         print("PASS TUI Ctrl+C: raw mode, alternate screen and cursor restored")
