@@ -9,18 +9,18 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File},
-    hash::{Hash, Hasher},
-    io::Read,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 use storage::{external, Metadata, SessionReader};
 
 mod bundle;
 mod output;
+mod provenance;
 
 pub use bundle::{AnalysisBundle, BandSummary, ChannelSummary, QualityCount, Summary};
 use output::OutputTransaction;
+use provenance::{hash_path, source_format, source_hashes};
 
 pub type AnalysisError = String;
 #[derive(Debug, Clone)]
@@ -360,53 +360,6 @@ fn window_name(window: core_types::WindowFunction) -> &'static str {
         core_types::WindowFunction::HannSymmetric => "hann_symmetric",
     }
 }
-fn source_hashes(input: &Path, meta: &Metadata) -> Result<BTreeMap<String, String>, String> {
-    let files = if input.is_dir() && input.join("metadata.json").is_file() {
-        ["metadata.json", "raw.csv", "events.csv", "experiment.json"]
-            .iter()
-            .map(|n| input.join(n))
-            .filter(|path| path.is_file())
-            .collect::<Vec<_>>()
-    } else if let Some(p) = &meta.provenance {
-        p.files_used.iter().map(PathBuf::from).collect()
-    } else {
-        vec![input.to_path_buf()]
-    };
-    files
-        .iter()
-        .map(|p| Ok((p.display().to_string(), hash_path(p)?)))
-        .collect()
-}
-fn hash_path(path: &Path) -> Result<String, AnalysisError> {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut files = Vec::new();
-    if path.is_dir() {
-        for e in fs::read_dir(path).map_err(|e| format!("analyze/hash {}: {e}", path.display()))? {
-            let p = e.map_err(|e| e.to_string())?.path();
-            if p.is_file() {
-                files.push(p)
-            }
-        }
-        files.sort();
-    } else {
-        files.push(path.to_path_buf());
-    }
-    for p in files {
-        p.file_name().hash(&mut h);
-        let mut f = File::open(&p).map_err(|e| format!("analyze/hash {}: {e}", p.display()))?;
-        let mut b = [0u8; 8192];
-        loop {
-            let n = f
-                .read(&mut b)
-                .map_err(|e| format!("analyze/hash {}: {e}", p.display()))?;
-            if n == 0 {
-                break;
-            }
-            h.write(&b[..n]);
-        }
-    }
-    Ok(format!("{:016x}", h.finish()))
-}
 fn split_block(block: RawSignalBlock, size: usize) -> Vec<RawSignalBlock> {
     let max = block
         .channels
@@ -446,12 +399,6 @@ fn split_block(block: RawSignalBlock, size: usize) -> Vec<RawSignalBlock> {
             },
         })
         .collect()
-}
-fn source_format(meta: &Metadata) -> String {
-    meta.provenance
-        .as_ref()
-        .map(|p| p.original_format.clone())
-        .unwrap_or_else(|| "lemon-session".into())
 }
 pub fn analyze(
     input: AnalysisInput,

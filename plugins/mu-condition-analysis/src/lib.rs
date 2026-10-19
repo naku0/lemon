@@ -1,5 +1,8 @@
 //! Descriptive Mu/Beta comparison between separate AnalysisBundle conditions.
+mod config;
 mod plot;
+
+pub use config::{Bands, Baseline, Condition, Config};
 
 use lemon_plugin_sdk::{
     write_plugin_result, Artifact, ArtifactKind, Bundle, PluginResult, PluginStatus,
@@ -25,35 +28,6 @@ pub struct Arguments {
     pub input: PathBuf,
     pub config: PathBuf,
     pub output: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    pub mode: String,
-    pub channels: Vec<String>,
-    pub bands: Bands,
-    pub window_seconds: f64,
-    pub hop_seconds: f64,
-    pub baseline: Baseline,
-    pub conditions: Vec<Condition>,
-}
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Bands {
-    pub mu_hz: [f64; 2],
-    pub beta_hz: [f64; 2],
-}
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Baseline {
-    pub label: String,
-}
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Condition {
-    pub label: String,
-    pub analysis_bundle: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +161,7 @@ pub fn run(args: Arguments) -> Result<(), String> {
     let config: Config =
         serde_json::from_reader(File::open(&config_path).map_err(|e| e.to_string())?)
             .map_err(|e| format!("config JSON: {e}"))?;
-    validate_config(&config)?;
+    config.validate()?;
     fs::create_dir_all(&args.output).map_err(|e| format!("output: {e}"))?;
     let baseline = Bundle::open(&args.input).map_err(|e| e.to_string())?;
     let config_dir = config_path
@@ -469,53 +443,6 @@ fn artifact(path: &str, kind: ArtifactKind, description: &str) -> Artifact {
         kind,
         description: description.into(),
     }
-}
-fn validate_config(c: &Config) -> Result<(), String> {
-    if c.mode != "condition-comparison" {
-        return Err("mode must be condition-comparison".into());
-    }
-    if c.channels.is_empty() || c.channels.len() > 32 {
-        return Err("channels must contain 1..32 entries".into());
-    }
-    if c.conditions.is_empty() {
-        return Err("conditions must contain at least one comparison bundle".into());
-    }
-    let mut unique = BTreeSet::new();
-    if c.channels
-        .iter()
-        .any(|v| v.trim().is_empty() || !unique.insert(v))
-    {
-        return Err("channels must be non-empty and unique".into());
-    }
-    if !c.window_seconds.is_finite()
-        || c.window_seconds <= 0.
-        || !c.hop_seconds.is_finite()
-        || c.hop_seconds <= 0.
-    {
-        return Err("window_seconds and hop_seconds must be positive finite values".into());
-    }
-    for (name, b) in [("mu_hz", c.bands.mu_hz), ("beta_hz", c.bands.beta_hz)] {
-        if !b[0].is_finite() || !b[1].is_finite() || b[0] < 0. || b[0] >= b[1] {
-            return Err(format!("invalid {name} range"));
-        }
-    }
-    if c.bands.mu_hz[0] < c.bands.beta_hz[1] && c.bands.beta_hz[0] < c.bands.mu_hz[1] {
-        return Err("Mu and Beta ranges must not overlap".into());
-    }
-    let mut labels = BTreeSet::new();
-    for label in std::iter::once(&c.baseline.label).chain(c.conditions.iter().map(|v| &v.label)) {
-        if label.trim().is_empty()
-            || label.len() > 128
-            || label.chars().any(char::is_control)
-            || !labels.insert(label)
-        {
-            return Err(
-                "condition labels must be unique, non-empty, printable and at most 128 bytes"
-                    .into(),
-            );
-        }
-    }
-    Ok(())
 }
 fn validate_bundles(config: &Config, inputs: &[(String, Bundle)]) -> Result<Vec<String>, String> {
     let baseline = &inputs[0].1;

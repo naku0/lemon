@@ -57,9 +57,13 @@ CLI-модули только переводят аргументы пользо
 | `crates/analysis/src/lib.rs` | Оркестрация анализа Raw-записи |
 | `crates/analysis/src/bundle.rs` | Публичный контракт чтения и проверки AnalysisBundle |
 | `crates/analysis/src/output.rs` | Staging, overwrite и атомарная публикация bundle |
+| `crates/analysis/src/provenance.rs` | Формат источника и хеши входных файлов |
 
 Плагины должны использовать публичные функции `processing` и читатели SDK. Не
 переносите в них копии PSD, правил формирования окон или проверки AnalysisBundle.
+Конфигурация и её валидация для `mu-condition-analysis` находятся в
+`plugins/mu-condition-analysis/src/config.rs`; `lib.rs` связывает чтение bundle,
+расчёт и запись артефактов.
 
 Для поиска причины ошибки двигайтесь по потоку данных:
 
