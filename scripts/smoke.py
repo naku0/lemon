@@ -197,8 +197,11 @@ def tui_run(config, exit_key, record):
 def serial_run(config):
     master, slave = pty.openpty()
     port = os.ttyname(slave)
+    # A virtual PTY does not reset like an Arduino when it is opened. Disable
+    # the device-oriented startup grace period so the bytes below exercise the
+    # CSV decoder and recovery path instead of being intentionally discarded.
     proc = subprocess.Popen([str(BIN), "live", "--config", str(config), "--settings", str(config.parent / "settings.json"), "--headless",
-                             "--record", "--port", port, "--channels", "1"],
+                             "--record", "--port", port, "--channels", "1", "--startup-delay-ms", "0"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV)
     try:
         time.sleep(0.2)
