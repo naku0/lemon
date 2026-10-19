@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root"
+
+echo "LEMON pre-commit: formatting"
+cargo fmt --all --check
+
+echo "LEMON pre-commit: clippy"
+cargo clippy --locked --workspace --all-targets -- -D warnings
+
+echo "LEMON pre-commit: staged diff"
+git diff --cached --check

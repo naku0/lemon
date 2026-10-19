@@ -1,6 +1,8 @@
 //! Descriptive Mu/Beta comparison between separate AnalysisBundle conditions.
 mod config;
+mod input;
 mod plot;
+mod results;
 
 pub use config::{Bands, Baseline, Condition, Config};
 
@@ -12,12 +14,17 @@ use processing::windows::{
     WindowingConfig,
 };
 use processing::{integrate_band_power, one_sided_psd, WindowFunction};
-use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env,
     fs::{self, File},
     path::PathBuf,
+};
+
+use input::{load_bundle, Event, Sample};
+use results::{
+    write_excluded, write_powers, write_results, ConditionResult, ExcludedWindow, Summary,
+    WindowPower,
 };
 
 pub const PLUGIN_ID: &str = "mu-condition-analysis";
@@ -28,107 +35,6 @@ pub struct Arguments {
     pub input: PathBuf,
     pub config: PathBuf,
     pub output: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct Sample {
-    timestamp_ns: u64,
-    sequence: u64,
-    value: Option<f64>,
-    quality: String,
-    flags: String,
-    segment_id: u64,
-    sample_valid: bool,
-}
-#[derive(Debug, Clone)]
-struct Event {
-    timestamp_ns: u64,
-    channel: Option<String>,
-    reason: String,
-}
-type SamplesByChannel = BTreeMap<String, Vec<Sample>>;
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WindowPower {
-    dsp_algorithm_version: u32,
-    psd_algorithm_version: u32,
-    window_function: String,
-    bundle: String,
-    condition: String,
-    channel: String,
-    window_index: u64,
-    segment_id: Option<u64>,
-    window_start_ns: u64,
-    window_end_ns: u64,
-    midpoint_seconds: f64,
-    band: String,
-    low_hz: f64,
-    high_hz: f64,
-    power: f64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExcludedWindow {
-    dsp_algorithm_version: u32,
-    bundle: String,
-    condition: String,
-    channel: String,
-    window_index: u64,
-    segment_id: Option<u64>,
-    window_start_ns: u64,
-    window_end_ns: u64,
-    reason: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConditionResult {
-    dsp_algorithm_version: u32,
-    psd_algorithm_version: u32,
-    window_function: String,
-    condition: String,
-    channel: String,
-    band: String,
-    valid_window_count: usize,
-    excluded_window_count: usize,
-    median_power: Option<f64>,
-    iqr_power: Option<f64>,
-    baseline_median_power: Option<f64>,
-    relative_change_percent: Option<f64>,
-    change_db: Option<f64>,
-    change_direction: Option<String>,
-}
-#[derive(Debug, Serialize)]
-struct Summary {
-    title: &'static str,
-    plugin_id: &'static str,
-    plugin_version: &'static str,
-    input_bundle_versions: BTreeMap<String, String>,
-    dsp_algorithm_versions: BTreeMap<String, u32>,
-    psd_algorithm_versions: BTreeMap<String, u32>,
-    computed_psd_algorithm_version: u32,
-    windowing_algorithm_version: u32,
-    input_windowing_algorithm_versions: BTreeMap<String, u32>,
-    input_processing_configs: BTreeMap<String, serde_json::Value>,
-    synchronization_status: BTreeMap<String, String>,
-    sample_rate_hz: f64,
-    sample_rates_hz: BTreeMap<String, f64>,
-    sample_rate_sources: BTreeMap<String, String>,
-    quality_assessment: BTreeMap<String, String>,
-    units: Option<String>,
-    channels: Vec<String>,
-    window_seconds: f64,
-    hop_seconds: f64,
-    window_samples: usize,
-    hop_samples: usize,
-    window_samples_by_input: BTreeMap<String, usize>,
-    hop_samples_by_input: BTreeMap<String, usize>,
-    window_function: &'static str,
-    psd_method: &'static str,
-    bands_hz: BTreeMap<String, [f64; 2]>,
-    valid_windows: BTreeMap<String, usize>,
-    excluded_windows: BTreeMap<String, usize>,
-    exclusion_reasons: BTreeMap<String, usize>,
-    bundle_excluded_windows: BTreeMap<String, usize>,
-    bundle_exclusion_reasons: BTreeMap<String, BTreeMap<String, usize>>,
-    warnings: Vec<String>,
-    limitations: Vec<String>,
 }
 
 pub fn parse_args() -> Result<Arguments, String> {
@@ -532,59 +438,6 @@ fn validate_bundles(config: &Config, inputs: &[(String, Bundle)]) -> Result<Vec<
     }
     Ok(warnings)
 }
-fn load_bundle(
-    bundle: &Bundle,
-    channels: &[String],
-) -> Result<(SamplesByChannel, Vec<Event>), String> {
-    let selected: BTreeSet<_> = channels.iter().cloned().collect();
-    let mut samples: BTreeMap<String, Vec<Sample>> =
-        channels.iter().map(|c| (c.clone(), Vec::new())).collect();
-    for row in bundle.processed().map_err(|e| e.to_string())? {
-        let row = row.map_err(|e| e.to_string())?;
-        if selected.contains(&row.channel) {
-            samples.entry(row.channel).or_default().push(Sample {
-                timestamp_ns: row.timestamp_ns,
-                sequence: row.sequence,
-                value: row.filtered,
-                quality: row.quality,
-                flags: row.flags,
-                segment_id: row.segment_id,
-                sample_valid: row.sample_valid && !row.filter_warmup && !row.artifact_rejected,
-            });
-        }
-    }
-    let mut events = Vec::new();
-    for row in bundle.quality_events().map_err(|e| e.to_string())? {
-        let row = row.map_err(|e| e.to_string())?;
-        if severe_event(&row.kind, &row.severity)
-            && (bundle.manifest().reject_low_quality_windows
-                || !row.kind.to_ascii_lowercase().contains("lowquality"))
-        {
-            events.push(Event {
-                timestamp_ns: row.timestamp_ns,
-                channel: row.channel.filter(|c| !c.is_empty()),
-                reason: format!("quality event: {}", row.kind),
-            });
-        }
-    }
-    Ok((samples, events))
-}
-fn severe_event(kind: &str, severity: &str) -> bool {
-    let k = kind.to_ascii_lowercase();
-    severity.eq_ignore_ascii_case("error")
-        || [
-            "lost",
-            "invalid",
-            "disconnect",
-            "outlier",
-            "saturation",
-            "lowquality",
-            "gap",
-        ]
-        .iter()
-        .any(|v| k.contains(v))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn analyze_channel(
     label: &str,
@@ -802,86 +655,6 @@ fn quantile(values: &[f64], q: f64) -> Option<f64> {
     let hi = pos.ceil() as usize;
     Some(sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64))
 }
-fn writer(path: PathBuf, headers: &[&str]) -> Result<csv::Writer<File>, String> {
-    let mut writer = csv::WriterBuilder::new()
-        .has_headers(false)
-        .from_path(&path)
-        .map_err(|e| e.to_string())?;
-    writer.write_record(headers).map_err(|e| e.to_string())?;
-    Ok(writer)
-}
-fn write_powers(path: PathBuf, rows: &[WindowPower]) -> Result<(), String> {
-    let mut writer = writer(
-        path,
-        &[
-            "dsp_algorithm_version",
-            "psd_algorithm_version",
-            "window_function",
-            "bundle",
-            "condition",
-            "channel",
-            "window_index",
-            "segment_id",
-            "window_start_ns",
-            "window_end_ns",
-            "midpoint_seconds",
-            "band",
-            "low_hz",
-            "high_hz",
-            "power",
-        ],
-    )?;
-    for row in rows {
-        writer.serialize(row).map_err(|e| e.to_string())?;
-    }
-    writer.flush().map_err(|e| e.to_string())
-}
-fn write_excluded(path: PathBuf, rows: &[ExcludedWindow]) -> Result<(), String> {
-    let mut writer = writer(
-        path,
-        &[
-            "dsp_algorithm_version",
-            "bundle",
-            "condition",
-            "channel",
-            "window_index",
-            "segment_id",
-            "window_start_ns",
-            "window_end_ns",
-            "reason",
-        ],
-    )?;
-    for row in rows {
-        writer.serialize(row).map_err(|e| e.to_string())?;
-    }
-    writer.flush().map_err(|e| e.to_string())
-}
-fn write_results(path: PathBuf, rows: &[ConditionResult]) -> Result<(), String> {
-    let mut writer = writer(
-        path,
-        &[
-            "dsp_algorithm_version",
-            "psd_algorithm_version",
-            "window_function",
-            "condition",
-            "channel",
-            "band",
-            "valid_window_count",
-            "excluded_window_count",
-            "median_power",
-            "iqr_power",
-            "baseline_median_power",
-            "relative_change_percent",
-            "change_db",
-            "change_direction",
-        ],
-    )?;
-    for row in rows {
-        writer.serialize(row).map_err(|e| e.to_string())?;
-    }
-    writer.flush().map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
