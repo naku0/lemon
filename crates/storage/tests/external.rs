@@ -120,7 +120,7 @@ fn dmov_recovers_split_fields_and_validates_dat_without_scaling_raw() {
 
 #[test]
 fn dmov_missing_channel_is_empty_and_time_gap_is_an_event() {
-    for tag in [b'0', b'2'] {
+    for tag in b"02".iter().copied() {
         let t = Temp::new();
         let input = t.0.join("missing.dmov");
         let mut bytes = dmov_packet(100, &[b'A', tag, 1]);
