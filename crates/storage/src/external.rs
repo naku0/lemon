@@ -187,8 +187,9 @@ fn layout(path: &Path, options: &Options, dat: bool) -> Result<Layout> {
     } else {
         match options.delimiter.as_str() {
             "" | "auto" => {
-                let found: Vec<_> = [b',', b';', b'\t']
-                    .into_iter()
+                let found: Vec<_> = b",;\t"
+                    .iter()
+                    .copied()
                     .filter(|d| first.contains(*d as char))
                     .collect();
                 if found.len() > 1 {
