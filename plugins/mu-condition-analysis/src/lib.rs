@@ -1,4 +1,5 @@
 //! Descriptive Mu/Beta comparison between separate AnalysisBundle conditions.
+mod compute;
 mod config;
 mod input;
 mod plot;
@@ -9,11 +10,6 @@ pub use config::{Bands, Baseline, Condition, Config};
 use lemon_plugin_sdk::{
     write_plugin_result, Artifact, ArtifactKind, Bundle, PluginResult, PluginStatus,
 };
-use processing::windows::{
-    flags_from_codes, AnalysisSample, LegacySegments, SignalFlag, WindowCandidate, WindowGenerator,
-    WindowingConfig,
-};
-use processing::{integrate_band_power, one_sided_psd, WindowFunction};
 use std::{
     collections::BTreeMap,
     env,
@@ -21,11 +17,9 @@ use std::{
     path::PathBuf,
 };
 
-use input::{load_bundle, Event, Sample};
-use results::{
-    write_excluded, write_powers, write_results, ConditionResult, ExcludedWindow, Summary,
-    WindowPower,
-};
+use compute::{aggregate, analyze_channel, ChannelAnalysis};
+use input::load_bundle;
+use results::{write_excluded, write_powers, write_results, ConditionResult, Summary, WindowPower};
 
 pub const PLUGIN_ID: &str = "mu-condition-analysis";
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -181,24 +175,24 @@ pub fn run(args: Arguments) -> Result<(), String> {
             .and_then(|name| name.to_str())
             .unwrap_or("analysis-bundle");
         for channel in &config.channels {
-            analyze_channel(
-                label,
+            let result = analyze_channel(ChannelAnalysis {
+                condition: label,
                 bundle_name,
                 channel,
-                samples.get(channel).map(Vec::as_slice).unwrap_or(&[]),
-                &events,
-                &config,
-                bundle_window_samples,
-                bundle_hop_samples,
-                bundle_rate,
-                bundle.manifest().dsp_algorithm_version,
-                processing::PSD_ALGORITHM_VERSION,
+                samples: samples.get(channel).map(Vec::as_slice).unwrap_or(&[]),
+                events: &events,
+                config: &config,
+                window_samples: bundle_window_samples,
+                hop_samples: bundle_hop_samples,
+                sample_rate_hz: bundle_rate,
+                dsp_algorithm_version: bundle.manifest().dsp_algorithm_version,
+                psd_algorithm_version: processing::PSD_ALGORITHM_VERSION,
                 sample_quality_reliable,
-                bundle.manifest().analysis_format_version < 2,
-                bundle.manifest().reject_low_quality_windows,
-                &mut powers,
-                &mut excluded,
-            )?;
+                legacy: bundle.manifest().analysis_format_version < 2,
+                reject_low_quality: bundle.manifest().reject_low_quality_windows,
+            })?;
+            powers.extend(result.powers);
+            excluded.extend(result.excluded);
         }
     }
     let results = aggregate(
@@ -438,226 +432,11 @@ fn validate_bundles(config: &Config, inputs: &[(String, Bundle)]) -> Result<Vec<
     }
     Ok(warnings)
 }
-#[allow(clippy::too_many_arguments)]
-fn analyze_channel(
-    label: &str,
-    bundle_name: &str,
-    channel: &str,
-    samples: &[Sample],
-    events: &[Event],
-    config: &Config,
-    window: usize,
-    hop: usize,
-    fs_hz: f64,
-    dsp_algorithm_version: u32,
-    psd_algorithm_version: u32,
-    sample_quality_reliable: bool,
-    legacy: bool,
-    reject_low_quality: bool,
-    powers: &mut Vec<WindowPower>,
-    excluded: &mut Vec<ExcludedWindow>,
-) -> Result<(), String> {
-    let mut window_config = WindowingConfig::new(window, hop, fs_hz);
-    window_config.reject_low_quality = reject_low_quality;
-    let mut segments = LegacySegments::new(window_config.clone())?;
-    let mut generator = WindowGenerator::new(window_config)?;
-    let mut consume = |candidate| -> Result<(), String> {
-        match candidate {
-            WindowCandidate::Rejected {
-                index,
-                segment_id,
-                start_timestamp_ns,
-                end_timestamp_ns,
-                reasons,
-                ..
-            } => {
-                excluded.push(ExcludedWindow {
-                    dsp_algorithm_version,
-                    bundle: bundle_name.into(),
-                    condition: label.into(),
-                    channel: channel.into(),
-                    window_index: index,
-                    segment_id,
-                    window_start_ns: start_timestamp_ns,
-                    window_end_ns: end_timestamp_ns,
-                    reason: reasons
-                        .iter()
-                        .map(|reason| reason.code())
-                        .collect::<Vec<_>>()
-                        .join("|"),
-                });
-            }
-            WindowCandidate::Accepted {
-                index,
-                segment_id,
-                start_timestamp_ns,
-                end_timestamp_ns,
-                samples,
-            } => {
-                let values = samples
-                    .iter()
-                    .map(|sample| sample.value.ok_or("plugin: accepted value missing"))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let psd = one_sided_psd(&values, fs_hz, WindowFunction::HannSymmetric)?;
-                for (band, range) in [("Mu", config.bands.mu_hz), ("Beta", config.bands.beta_hz)] {
-                    powers.push(WindowPower {
-                        dsp_algorithm_version,
-                        psd_algorithm_version,
-                        window_function: "hann_symmetric".into(),
-                        bundle: bundle_name.into(),
-                        condition: label.into(),
-                        channel: channel.into(),
-                        window_index: index,
-                        segment_id: Some(segment_id),
-                        window_start_ns: start_timestamp_ns,
-                        window_end_ns: end_timestamp_ns,
-                        midpoint_seconds: (start_timestamp_ns as f64 + end_timestamp_ns as f64)
-                            / 2e9,
-                        band: band.into(),
-                        low_hz: range[0],
-                        high_hz: range[1],
-                        power: integrate_band_power(&psd, range[0], range[1])?,
-                    });
-                }
-            }
-        }
-        Ok(())
-    };
-    for sample in samples {
-        let mut flags = flags_from_codes(&sample.flags);
-        // v2 per-sample metadata is authoritative. Legacy event records supply
-        // conservative additional flags, not a second window-validation pass.
-        if legacy {
-            if sample_quality_reliable
-                && !matches!(sample.quality.as_str(), "Good" | "Acceptable" | "Fair")
-            {
-                flags.push(SignalFlag::LowQuality);
-            }
-            for event in events.iter().filter(|event| {
-                event.timestamp_ns == sample.timestamp_ns
-                    && event.channel.as_deref().is_none_or(|id| id == channel)
-            }) {
-                let code = event.reason.trim_start_matches("quality event: ");
-                flags.extend(flags_from_codes(code));
-            }
-        }
-        let segment_id = if legacy {
-            segments.segment(sample.sequence, sample.timestamp_ns)
-        } else {
-            sample.segment_id
-        };
-        for candidate in generator.push(AnalysisSample {
-            sequence: sample.sequence,
-            timestamp_ns: sample.timestamp_ns,
-            segment_id,
-            value: sample.value,
-            eligible: sample.sample_valid,
-            flags,
-        }) {
-            consume(candidate)?;
-        }
-    }
-    if let Some(candidate) = generator.finish() {
-        consume(candidate)?;
-    }
-    Ok(())
-}
-fn aggregate(
-    config: &Config,
-    powers: &[WindowPower],
-    excluded: &[ExcludedWindow],
-    dsp_algorithm_version: u32,
-    psd_algorithm_version: u32,
-    warnings: &mut Vec<String>,
-) -> Vec<ConditionResult> {
-    let mut grouped: BTreeMap<(String, String, String), Vec<f64>> = BTreeMap::new();
-    for p in powers {
-        grouped
-            .entry((p.condition.clone(), p.channel.clone(), p.band.clone()))
-            .or_default()
-            .push(p.power);
-    }
-    let mut excluded_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for e in excluded {
-        *excluded_counts
-            .entry((e.condition.clone(), e.channel.clone()))
-            .or_default() += 1;
-    }
-    let mut out = Vec::new();
-    for condition in
-        std::iter::once(&config.baseline.label).chain(config.conditions.iter().map(|c| &c.label))
-    {
-        for channel in &config.channels {
-            for band in ["Mu", "Beta"] {
-                let key = (condition.clone(), channel.clone(), band.into());
-                let values = grouped.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-                let median = quantile(values, 0.5);
-                let iqr = quantile(values, 0.75)
-                    .zip(quantile(values, 0.25))
-                    .map(|(a, b)| a - b);
-                let base = grouped
-                    .get(&(config.baseline.label.clone(), channel.clone(), band.into()))
-                    .and_then(|v| quantile(v, 0.5));
-                let ratio = if condition == &config.baseline.label {
-                    None
-                } else {
-                    median.zip(base).and_then(|(m, b)| {
-                        if b > f64::EPSILON && m >= 0. {
-                            Some(m / b)
-                        } else {
-                            None
-                        }
-                    })
-                };
-                if condition != &config.baseline.label && ratio.is_none() {
-                    warnings.push(format!("Cannot calculate change for condition {condition:?}, channel {channel:?}, band {band}: baseline or condition median is unavailable or baseline is near zero."));
-                }
-                out.push(ConditionResult {
-                    dsp_algorithm_version,
-                    psd_algorithm_version,
-                    window_function: "hann_symmetric".into(),
-                    condition: condition.clone(),
-                    channel: channel.clone(),
-                    band: band.into(),
-                    valid_window_count: values.len(),
-                    excluded_window_count: *excluded_counts
-                        .get(&(condition.clone(), channel.clone()))
-                        .unwrap_or(&0),
-                    median_power: median,
-                    iqr_power: iqr,
-                    baseline_median_power: base,
-                    relative_change_percent: ratio.map(|r| 100. * (r - 1.)),
-                    change_db: ratio.filter(|r| *r > 0.).map(|r| 10. * r.log10()),
-                    change_direction: ratio.map(|r| {
-                        if r < 1.0 {
-                            "decrease relative to background"
-                        } else if r > 1.0 {
-                            "increase relative to background"
-                        } else {
-                            "no change relative to background"
-                        }
-                        .into()
-                    }),
-                });
-            }
-        }
-    }
-    out
-}
-fn quantile(values: &[f64], q: f64) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let pos = q * (sorted.len() - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    Some(sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::results::ExcludedWindow;
+    use processing::{integrate_band_power, one_sided_psd, WindowFunction};
     use std::{
         path::Path,
         sync::atomic::{AtomicUsize, Ordering},
